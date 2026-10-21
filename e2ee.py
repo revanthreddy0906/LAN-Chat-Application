@@ -1,0 +1,278 @@
+"""End-to-end encryption building blocks (needs the `cryptography` package).
+
+Each person has an identity: an X25519 key pair for key agreement and an Ed25519 key pair
+for signing. The server only ever sees the public halves. Everything here is a small,
+explicit composition of audited primitives from `cryptography`: X25519, Ed25519, HKDF-SHA256,
+ChaCha20-Poly1305 and scrypt. Nothing in this file invents a cipher.
+
+Without the package the rest of the app still works over TLS; `AVAILABLE` says which it is.
+"""
+
+from __future__ import annotations
+
+import base64
+import hashlib
+import hmac
+import os
+import secrets
+from dataclasses import dataclass
+
+try:
+    from cryptography.exceptions import InvalidSignature, InvalidTag
+    from cryptography.hazmat.primitives import hashes
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey, Ed25519PublicKey
+    from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey, X25519PublicKey
+    from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
+    from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+    from cryptography.hazmat.primitives.kdf.scrypt import Scrypt
+    from cryptography.hazmat.primitives.serialization import Encoding, NoEncryption, PrivateFormat, PublicFormat
+
+    AVAILABLE = True
+except ImportError:  # the chat still works, over TLS only
+    AVAILABLE = False
+
+SCRYPT_N = 2**15  # about 100 ms and 32 MB; tests lower it to stay fast
+SCRYPT_R = 8
+SCRYPT_P = 1
+RECOVERY_ALPHABET = "ABCDEFGHJKMNPQRSTUVWXYZ23456789"  # no 0/O, 1/I/L look-alikes
+RECOVERY_LENGTH = 24  # 24 characters of a 31-letter alphabet is about 119 bits
+KEYFILE_AAD = b"lanchat-keyfile-v1"
+BACKUP_AAD = b"lanchat-backup-v1"
+
+
+class CryptoError(Exception):
+    """Anything that should make the caller refuse the data: bad key, tampering, wrong passphrase."""
+
+
+class WrongPassphrase(CryptoError):
+    pass
+
+
+def require() -> None:
+    if not AVAILABLE:
+        raise CryptoError("end-to-end encryption needs the 'cryptography' package (pip install cryptography)")
+
+
+def b64(data: bytes) -> str:
+    return base64.b64encode(data).decode("ascii")
+
+
+def unb64(text: str) -> bytes:
+    try:
+        return base64.b64decode(text.encode("ascii"), validate=True)
+    except (ValueError, UnicodeError, AttributeError, TypeError) as error:
+        raise CryptoError("malformed key data") from error
+
+
+# ----- identities -----
+
+@dataclass(frozen=True)
+class Bundle:
+    """The public half of an identity: what the server stores and contacts pin."""
+
+    dh: bytes  # X25519 public key
+    sign: bytes  # Ed25519 public key
+    sig: bytes  # the signing key's signature over both keys (they belong together)
+
+    def to_dict(self) -> dict:
+        return {"dh": b64(self.dh), "sign": b64(self.sign), "sig": b64(self.sig)}
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "Bundle":
+        try:
+            bundle = cls(unb64(data["dh"]), unb64(data["sign"]), unb64(data["sig"]))
+        except (KeyError, TypeError) as error:
+            raise CryptoError("incomplete key bundle") from error
+        if len(bundle.dh) != 32 or len(bundle.sign) != 32 or len(bundle.sig) != 64:
+            raise CryptoError("key bundle has the wrong sizes")
+        return bundle
+
+    def verify(self) -> bool:
+        """True if the two public keys were signed together by the signing key."""
+        require()
+        try:
+            Ed25519PublicKey.from_public_bytes(self.sign).verify(self.sig, _bundle_message(self.dh, self.sign))
+            return True
+        except (InvalidSignature, ValueError):
+            return False
+
+    def fingerprint(self) -> str:
+        return hashlib.sha256(self.dh + self.sign).hexdigest()
+
+
+def _bundle_message(dh: bytes, sign: bytes) -> bytes:
+    return b"lanchat-bundle-v1" + dh + sign
+
+
+def _raw_public(key) -> bytes:
+    return key.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)
+
+
+def _raw_private(key) -> bytes:
+    return key.private_bytes(Encoding.Raw, PrivateFormat.Raw, NoEncryption())
+
+
+class Identity:
+    def __init__(self, dh_private, sign_private) -> None:
+        require()
+        self.dh, self.sign = dh_private, sign_private
+
+    @classmethod
+    def generate(cls) -> "Identity":
+        require()
+        return cls(X25519PrivateKey.generate(), Ed25519PrivateKey.generate())
+
+    @classmethod
+    def from_secret(cls, secret: bytes) -> "Identity":
+        require()
+        if len(secret) != 64:
+            raise CryptoError("secret key data has the wrong size")
+        return cls(X25519PrivateKey.from_private_bytes(secret[:32]), Ed25519PrivateKey.from_private_bytes(secret[32:]))
+
+    def secret_bytes(self) -> bytes:
+        return _raw_private(self.dh) + _raw_private(self.sign)
+
+    def public(self) -> Bundle:
+        dh, sign = _raw_public(self.dh), _raw_public(self.sign)
+        return Bundle(dh, sign, self.sign.sign(_bundle_message(dh, sign)))
+
+
+# ----- wrapping secrets with a passphrase or recovery code -----
+
+def _derive(passphrase: str, salt: bytes, n: int, r: int, p: int) -> bytes:
+    return Scrypt(salt=salt, length=32, n=n, r=r, p=p).derive(passphrase.encode("utf-8"))
+
+
+def wrap(secret: bytes, passphrase: str, aad: bytes = KEYFILE_AAD) -> dict:
+    """Encrypt `secret` under a key stretched from `passphrase` (scrypt) with ChaCha20-Poly1305."""
+    require()
+    salt, nonce = os.urandom(16), os.urandom(12)
+    key = _derive(passphrase, salt, SCRYPT_N, SCRYPT_R, SCRYPT_P)
+    return {"v": 1, "kdf": "scrypt", "n": SCRYPT_N, "r": SCRYPT_R, "p": SCRYPT_P, "salt": b64(salt),
+            "nonce": b64(nonce), "ct": b64(ChaCha20Poly1305(key).encrypt(nonce, secret, aad))}
+
+
+def unwrap(blob: dict, passphrase: str, aad: bytes = KEYFILE_AAD) -> bytes:
+    require()
+    try:
+        n, r, p = int(blob["n"]), int(blob["r"]), int(blob["p"])
+        if not (2**10 <= n <= 2**20 and 1 <= r <= 16 and 1 <= p <= 4):  # never let a file pick absurd costs
+            raise CryptoError("unreasonable key-stretching settings in the key file")
+        key = _derive(passphrase, unb64(blob["salt"]), n, r, p)
+        return ChaCha20Poly1305(key).decrypt(unb64(blob["nonce"]), unb64(blob["ct"]), aad)
+    except InvalidTag as error:
+        raise WrongPassphrase("wrong passphrase (or the key file was changed)") from error
+    except (KeyError, TypeError, ValueError) as error:
+        raise CryptoError("the key file is damaged") from error
+
+
+def new_recovery_code() -> str:
+    """A random code to write down: six groups of four, about 119 bits."""
+    letters = "".join(secrets.choice(RECOVERY_ALPHABET) for _ in range(RECOVERY_LENGTH))
+    return "-".join(letters[i:i + 4] for i in range(0, RECOVERY_LENGTH, 4))
+
+
+def normalize_recovery_code(code: str) -> str:
+    return "".join(ch for ch in code.upper() if ch in RECOVERY_ALPHABET)
+
+
+def valid_recovery_code(code: str) -> bool:
+    return len(normalize_recovery_code(code)) == RECOVERY_LENGTH
+
+
+# ----- the backup the server holds for you (opaque to it) -----
+
+def make_backup(identity: Identity, recovery_code: str) -> dict:
+    """Your secret keys wrapped with the recovery code, safe to hand to the server."""
+    return {"v": 1, "bundle": identity.public().to_dict(),
+            "wrapped": wrap(identity.secret_bytes(), normalize_recovery_code(recovery_code), BACKUP_AAD)}
+
+
+def open_backup(backup: dict, recovery_code: str) -> Identity:
+    if not valid_recovery_code(recovery_code):
+        raise WrongPassphrase("a recovery code is 24 letters and digits, like ABCD-EFGH-...")
+    try:
+        identity = Identity.from_secret(unwrap(backup["wrapped"], normalize_recovery_code(recovery_code), BACKUP_AAD))
+        if identity.public().dh != Bundle.from_dict(backup["bundle"]).dh:
+            raise CryptoError("the backup does not match its public keys")
+    except (KeyError, TypeError) as error:
+        raise CryptoError("the backup is damaged") from error
+    return identity
+
+
+# ----- safety numbers -----
+
+def safety_number(name_a: str, bundle_a: Bundle, name_b: str, bundle_b: Bundle) -> str:
+    """Sixty digits both people see identically, for comparing aloud or in person.
+
+    It covers both names and both identity keys, so a server that swapped either key would
+    produce a different number on the two screens.
+    """
+    parts = sorted((name_a.lower().encode() + b"\0" + bundle_a.dh + bundle_a.sign,
+                    name_b.lower().encode() + b"\0" + bundle_b.dh + bundle_b.sign))
+    digest = b"lanchat-safety-v1" + b"".join(parts)
+    for _ in range(5200):  # a little stretching makes brute-forcing a look-alike key costly
+        digest = hashlib.sha512(digest).digest()
+    groups = [f"{int.from_bytes(digest[i * 5:(i + 1) * 5], 'big') % 100000:05d}" for i in range(12)]
+    return " ".join(groups)
+
+
+# ----- sealed messages for one recipient -----
+
+def aad_for(kind: str, sender: str, recipient: str) -> bytes:
+    """Context bound into every sealed message so it cannot be replayed somewhere else."""
+    return f"lanchat-msg-v1|{kind}|{sender.lower()}|{recipient.lower()}".encode()
+
+
+def seal(plaintext: bytes, me: Identity, recipient_dh: bytes, aad: bytes) -> dict:
+    """Encrypt for one person: ephemeral and static Diffie-Hellman, HKDF, ChaCha20-Poly1305, signed."""
+    require()
+    try:
+        recipient_key = X25519PublicKey.from_public_bytes(recipient_dh)
+    except ValueError as error:
+        raise CryptoError("the recipient's key is not valid") from error
+    ephemeral = X25519PrivateKey.generate()
+    epk = _raw_public(ephemeral)
+    key = _message_key(ephemeral.exchange(recipient_key), me.dh.exchange(recipient_key),
+                       epk, _raw_public(me.dh), recipient_dh)
+    nonce = os.urandom(12)
+    ciphertext = ChaCha20Poly1305(key).encrypt(nonce, plaintext, aad)
+    signature = me.sign.sign(_envelope_message(epk, nonce, ciphertext, aad))
+    return {"v": 1, "epk": b64(epk), "n": b64(nonce), "ct": b64(ciphertext), "sig": b64(signature)}
+
+
+def open_sealed(envelope: dict, me: Identity, sender: Bundle, aad: bytes) -> bytes:
+    """Decrypt a sealed message from `sender`. Raises CryptoError for anything not exactly as sent."""
+    require()
+    try:
+        epk, nonce = unb64(envelope["epk"]), unb64(envelope["n"])
+        ciphertext, signature = unb64(envelope["ct"]), unb64(envelope["sig"])
+        if envelope.get("v") != 1 or len(epk) != 32 or len(nonce) != 12:
+            raise CryptoError("unsupported or malformed message")
+        try:
+            Ed25519PublicKey.from_public_bytes(sender.sign).verify(
+                signature, _envelope_message(epk, nonce, ciphertext, aad))
+        except InvalidSignature as error:
+            raise CryptoError("the message is not signed by the person it claims to be from") from error
+        ephemeral_key = X25519PublicKey.from_public_bytes(epk)
+        sender_key = X25519PublicKey.from_public_bytes(sender.dh)
+        key = _message_key(me.dh.exchange(ephemeral_key), me.dh.exchange(sender_key),
+                           epk, sender.dh, _raw_public(me.dh))
+        return ChaCha20Poly1305(key).decrypt(nonce, ciphertext, aad)
+    except InvalidTag as error:
+        raise CryptoError("the message was altered or is not for you") from error
+    except (KeyError, TypeError, ValueError) as error:
+        raise CryptoError("malformed message") from error
+
+
+def _message_key(dh_ephemeral: bytes, dh_static: bytes, epk: bytes, sender_dh: bytes, recipient_dh: bytes) -> bytes:
+    return HKDF(algorithm=hashes.SHA256(), length=32, salt=None,
+                info=b"lanchat-seal-v1" + epk + sender_dh + recipient_dh).derive(dh_ephemeral + dh_static)
+
+
+def _envelope_message(epk: bytes, nonce: bytes, ciphertext: bytes, aad: bytes) -> bytes:
+    return b"lanchat-envelope-v1" + epk + nonce + ciphertext + aad
+
+
+def constant_time_equal(a: str, b: str) -> bool:
+    return hmac.compare_digest(a.encode(), b.encode())

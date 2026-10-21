@@ -1,0 +1,142 @@
+"""Where one person's encryption keys and pinned contacts live on this computer.
+
+    ~/.lanchat/keys/<server id>/<username>.key        secret keys, wrapped with the passphrase
+    ~/.lanchat/keys/<server id>/<username>.contacts   the keys of people you have talked to
+
+The server id is the server certificate's fingerprint, so keys made for one chat are never
+offered to another. Contacts are pinned the way certificates are: the first key you see for a
+name is remembered, and a different one later is reported instead of silently accepted.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import threading
+from pathlib import Path
+
+import e2ee
+from e2ee import Bundle, CryptoError, Identity
+
+VERSION = 1
+
+
+def server_id(fingerprint: str | None, host: str = "", port: int = 0) -> str:
+    """A folder name for a server: its certificate fingerprint, or host and port if it has none."""
+    if fingerprint:
+        return "".join(ch for ch in fingerprint.lower() if ch.isalnum())[:32]
+    return f"plain-{host}-{port}".replace("/", "_")
+
+
+class KeyStore:
+    def __init__(self, home: str | os.PathLike[str], server: str, username: str) -> None:
+        self.folder = Path(home) / "keys" / server
+        stem = username.lower()
+        self.key_path = self.folder / f"{stem}.key"
+        self.contacts_path = self.folder / f"{stem}.contacts"
+        self._lock = threading.Lock()
+
+    # ----- my keys -----
+
+    def exists(self) -> bool:
+        return self.key_path.is_file()
+
+    def _write(self, path: Path, data: dict) -> None:
+        self.folder.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_suffix(path.suffix + ".tmp")
+        temporary.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        os.chmod(temporary, 0o600)
+        os.replace(temporary, path)
+
+    def _read(self, path: Path) -> dict:
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as error:
+            raise CryptoError("the key file is missing or damaged") from error
+        if not isinstance(data, dict):
+            raise CryptoError("the key file is damaged")
+        return data
+
+    def save_identity(self, identity: Identity, passphrase: str) -> None:
+        with self._lock:
+            self._write(self.key_path, {"v": VERSION, "bundle": identity.public().to_dict(),
+                                        "wrapped": e2ee.wrap(identity.secret_bytes(), passphrase)})
+
+    def create(self, passphrase: str) -> tuple[Identity, str, dict]:
+        """Make new keys. Returns (identity, recovery code to show once, backup to upload)."""
+        identity, code = Identity.generate(), e2ee.new_recovery_code()
+        self.save_identity(identity, passphrase)
+        return identity, code, e2ee.make_backup(identity, code)
+
+    def unlock(self, passphrase: str) -> Identity:
+        data = self._read(self.key_path)
+        try:
+            identity = Identity.from_secret(e2ee.unwrap(data["wrapped"], passphrase))
+        except KeyError as error:
+            raise CryptoError("the key file is damaged") from error
+        if identity.public().dh != self.public_bundle().dh:
+            raise CryptoError("the key file does not match its public keys")
+        return identity
+
+    def public_bundle(self) -> Bundle:
+        try:
+            return Bundle.from_dict(self._read(self.key_path)["bundle"])
+        except KeyError as error:
+            raise CryptoError("the key file is damaged") from error
+
+    def restore(self, recovery_code: str, backup: dict, new_passphrase: str) -> Identity:
+        """Bring keys back on a new computer from the server's backup and your recovery code."""
+        identity = e2ee.open_backup(backup, recovery_code)
+        self.save_identity(identity, new_passphrase)
+        return identity
+
+    def change_passphrase(self, old: str, new: str) -> None:
+        self.save_identity(self.unlock(old), new)
+
+    def reset(self) -> None:
+        """Forget my keys and everyone I pinned (their keys stay valid; mine are being replaced)."""
+        for path in (self.key_path, self.contacts_path):
+            path.unlink(missing_ok=True)
+
+    # ----- pinned contacts -----
+
+    def _contacts(self) -> dict:
+        try:
+            data = json.loads(self.contacts_path.read_text(encoding="utf-8"))
+            return data if isinstance(data, dict) else {}
+        except (OSError, ValueError):
+            return {}
+
+    def contact(self, name: str) -> dict | None:
+        with self._lock:
+            return self._contacts().get(name.lower())
+
+    def check_contact(self, name: str, bundle: Bundle) -> str:
+        """'new' (never seen), 'same' (matches the pin) or 'changed' (a different key than before)."""
+        known = self.contact(name)
+        if known is None:
+            return "new"
+        return "same" if known["fp"] == bundle.fingerprint() else "changed"
+
+    def pin_contact(self, name: str, bundle: Bundle, verified: bool = False) -> None:
+        """Remember this key for `name`. Pinning a different key clears the 'verified' mark."""
+        with self._lock:
+            contacts = self._contacts()
+            known = contacts.get(name.lower())
+            same = known is not None and known["fp"] == bundle.fingerprint()
+            contacts[name.lower()] = {"name": name, "fp": bundle.fingerprint(), "bundle": bundle.to_dict(),
+                                      "verified": bool(verified or (same and known.get("verified")))}
+            self._write(self.contacts_path, contacts)
+
+    def mark_verified(self, name: str) -> bool:
+        with self._lock:
+            contacts = self._contacts()
+            if name.lower() not in contacts:
+                return False
+            contacts[name.lower()]["verified"] = True
+            self._write(self.contacts_path, contacts)
+            return True
+
+    def is_verified(self, name: str) -> bool:
+        known = self.contact(name)
+        return bool(known and known.get("verified"))

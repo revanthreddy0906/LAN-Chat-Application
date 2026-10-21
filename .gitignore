@@ -1,0 +1,28 @@
+# Real accounts, messages and shared files: never publish these
+accounts.db
+accounts.db-*
+accounts.json
+accounts.json.bak
+accounts_files/
+*.db
+*.db-journal
+
+# Keys, certificates and per-computer settings (normally in ~/.lanchat, listed in case they are copied here)
+*.key
+*.crt
+*.pem
+.lanchat/
+
+# Demo server data and logs (the demo scripts themselves are kept)
+demo/home/
+demo/*.db
+demo/*.db-*
+demo/*_files/
+demo/*.log
+
+# Python and tool clutter
+__pycache__/
+*.pyc
+.claude/
+paper/.claude/
+.DS_Store
