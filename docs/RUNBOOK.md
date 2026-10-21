@@ -55,3 +55,14 @@ Replace the Python files and start the server. The database upgrades itself (num
 - **"The certificate has CHANGED" on clients:** `~/.lanchat/server.*` was replaced. If that was you, tell people to remove the old entry under `servers` in their `settings.json`.
 - **Uploads fail with "damaged in transfer":** the network dropped data; try again.
 - **`database is locked`:** two processes are writing at once (for example the admin tool during a busy moment); retry.
+
+## End-to-end encryption on the server
+
+| Situation | Do this |
+|---|---|
+| Turn on encryption for the group room | Admin console → Settings → "Encrypt the group room" → on. Check the list of people without keys first. |
+| Make private messages and files encrypted-only | Settings → "End-to-end encryption" → required. |
+| Someone left or a computer was lost | Disable them (this re-keys the room automatically) or press "Re-key the room now". |
+| A person lost their passphrase and recovery code | They can only reset their keys; their earlier encrypted messages cannot be recovered by you or by them. You cannot read them either. |
+| "Security code changed" warnings | Normal after someone rotates or resets keys; they should compare codes with the person. |
+| Backups | `accounts.db` and `accounts_files/` hold only ciphertext for encrypted conversations; keep them together. Secret keys are never on the server, so a restored server still needs each person's own key file or recovery code. |

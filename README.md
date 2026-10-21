@@ -2,7 +2,7 @@
 
 A secure team chat for people on the same Wi-Fi or LAN, built with Python's standard library only. Source: https://github.com/revanthreddy0906/LAN-Chat-Application Messages are encrypted, accounts have roles, you can share pictures, files and audio, and other computers find your chat automatically.
 
-More detail lives in [`docs/`](docs): [architecture](docs/ARCHITECTURE.md), [protocol](docs/PROTOCOL.md), [security and its limits](docs/SECURITY.md), and a [runbook](docs/RUNBOOK.md) for whoever hosts the chat.
+More detail lives in [`docs/`](docs): [architecture](docs/ARCHITECTURE.md), [protocol](docs/PROTOCOL.md), [security and its limits](docs/SECURITY.md), the [end-to-end encryption design](docs/E2EE.md), a [runbook](docs/RUNBOOK.md) for whoever hosts the chat, and a [demo script](docs/DEMO.md).
 
 ## Quick start
 
@@ -56,6 +56,7 @@ Requirements: Python 3.10+ with Tkinter (included with most installs). `openssl`
 
 **Your account (the ⋯ button)**
 - **Change password…** signs out every other saved sign-in.
+- **Encryption keys…** shows your fingerprint, and lets you **rotate** your keys (new keys and recovery code; earlier messages stay readable) or reset them. **Lock now** and **Auto-lock** cover the window and forget the keys until you enter your passphrase again (default: after 15 idle minutes).
 - **Download my data…** saves a JSON file of everything you wrote or received privately.
 - **Admin console…** (admins only), see below.
 
@@ -110,13 +111,18 @@ Files on your computer: `~/.lanchat/settings.json` (last username, theme, truste
 ## Tests
 
 ```text
-python3 -m unittest            # about 280 tests, a minute and a half
+python3 -m unittest            # about 450 tests, two minutes
 python3 drivers/media.py       # scripted runs of the real window: pictures and files
 python3 drivers/search_pins.py # paging, search, mentions, pins
 python3 drivers/admin.py       # admin console, password change, saved sign-in, data export
 python3 drivers/basics.py      # sign in, reply, edit, react, private messages, theme
 python3 drivers/hosting.py     # hosting from the window over TLS
 python3 drivers/terminal.py    # the real terminal client, with every security default on
+python3 drivers/e2ee.py        # encryption keys: setup, restore, verify, reset
+python3 drivers/e2ee_messages.py   # encrypted private messages
+python3 drivers/e2ee_files.py      # encrypted pictures, files and audio
+python3 drivers/e2ee_room.py       # the encrypted group room
+python3 drivers/e2ee_hardening.py  # key rotation, restore on a new computer, the app lock
 LANCHAT_STRICT=1 python3 drivers/media.py   # the same, with rate limits and password rules switched on
 ```
 

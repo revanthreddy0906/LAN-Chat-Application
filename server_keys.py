@@ -57,15 +57,18 @@ class KeysMixin:
                                           e2ee.b64(bundle.sig), bundle.fingerprint())
         if backup is not None:
             self.store.set_backup(client.user_id, json.dumps(backup))
+        rotated = status == "changed" and event.get("rotated") is True
         if status != "same":
-            self.audit(client.username, f"keys_{status}", detail=f"fingerprint {bundle.fingerprint()[:16]}")
-        if status == "changed":
-            self.store.delete_envelopes_to(client.user_id)  # they were sealed to the old key and can never be opened
+            self.audit(client.username, "keys_rotated" if rotated else f"keys_{status}",
+                       detail=f"fingerprint {bundle.fingerprint()[:16]}")
+        if status == "changed" and not rotated:
+            self.store.delete_envelopes_to(client.user_id)  # sealed to a key that is gone and can never be opened
+        # (a rotation keeps them: the person holds their old identity and can still open them)
         if status in ("changed", "created"):  # created: people who found no keys for them should look again
             with self._lock:
                 others = [c for c in self._clients.values() if c is not client]
             self._emit({"t": "key_changed", "user": client.username, "fingerprint": bundle.fingerprint(),
-                        "created": status == "created"}, others)
+                        "created": status == "created", "rotated": rotated}, others)
         self._keys_reply(client, req, True, status=status, fingerprint=bundle.fingerprint())
 
     def _on_keys_get(self, client, event: dict) -> None:

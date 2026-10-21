@@ -22,8 +22,9 @@ MAX_GROUP_JUMP = 1000  # how far ahead of the server's last number a new message
 
 
 class RoomKeys:
-    def __init__(self, identity: Identity, name: str) -> None:
+    def __init__(self, identity: Identity, name: str, older: list[Identity] | None = None) -> None:
         self.identity, self.name = identity, name
+        self.older = list(older or [])  # earlier identities, still able to open envelopes sealed to them
         self.chains: dict[tuple[str, int], dict[int, bytes]] = {}  # (sender, epoch) -> {first number: chain key}
         self.seen: dict[tuple[str, int, int], int] = {}  # (sender, epoch, number) -> message id
 
@@ -61,11 +62,14 @@ class RoomKeys:
             raise CryptoError("the key envelope is malformed")
         data, last = None, CryptoError("no key for the sender")
         for bundle in sender_bundles:
-            try:
-                data = e2ee.open_sealed(envelope, self.identity, bundle, e2ee.group_key_aad(sender, self.name, epoch))
+            for mine in [self.identity, *self.older]:
+                try:
+                    data = e2ee.open_sealed(envelope, mine, bundle, e2ee.group_key_aad(sender, self.name, epoch))
+                    break
+                except CryptoError as error:
+                    last = error
+            if data is not None:
                 break
-            except CryptoError as error:
-                last = error
         if data is None:
             raise last
         try:

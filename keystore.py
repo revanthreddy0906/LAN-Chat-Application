@@ -20,6 +20,7 @@ from e2ee import Bundle, CryptoError, Identity
 
 VERSION = 1
 MAX_PREVIOUS_KEYS = 5
+MAX_PREVIOUS_IDENTITIES = 4
 
 
 def server_id(fingerprint: str | None, host: str = "", port: int = 0) -> str:
@@ -58,10 +59,17 @@ class KeyStore:
             raise CryptoError("the key file is damaged")
         return data
 
-    def save_identity(self, identity: Identity, passphrase: str) -> None:
+    def save_identities(self, identities: list[Identity], passphrase: str) -> None:
+        """Write the current identity (first) and any older ones, all wrapped under the passphrase."""
         with self._lock:
-            self._write(self.key_path, {"v": VERSION, "bundle": identity.public().to_dict(),
-                                        "wrapped": e2ee.wrap(identity.secret_bytes(), passphrase)})
+            self._write(self.key_path, {
+                "v": VERSION, "bundle": identities[0].public().to_dict(),
+                "wrapped": e2ee.wrap(identities[0].secret_bytes(), passphrase),
+                "previous": [{"bundle": old.public().to_dict(), "wrapped": e2ee.wrap(old.secret_bytes(), passphrase)}
+                             for old in identities[1:1 + MAX_PREVIOUS_IDENTITIES]]})
+
+    def save_identity(self, identity: Identity, passphrase: str) -> None:
+        self.save_identities([identity], passphrase)
 
     def create(self, passphrase: str) -> tuple[Identity, str, dict]:
         """Make new keys. Returns (identity, recovery code to show once, backup to upload)."""
@@ -69,15 +77,34 @@ class KeyStore:
         self.save_identity(identity, passphrase)
         return identity, code, e2ee.make_backup(identity, code)
 
-    def unlock(self, passphrase: str) -> Identity:
+    def unlock_all(self, passphrase: str) -> list[Identity]:
+        """The current identity, then the older ones kept for opening earlier messages."""
         data = self._read(self.key_path)
         try:
-            identity = Identity.from_secret(e2ee.unwrap(data["wrapped"], passphrase))
-        except KeyError as error:
+            identities = [Identity.from_secret(e2ee.unwrap(data["wrapped"], passphrase))]
+            if identities[0].public().dh != self.public_bundle().dh:
+                raise CryptoError("the key file does not match its public keys")
+            for entry in data.get("previous", []):
+                old = Identity.from_secret(e2ee.unwrap(entry["wrapped"], passphrase))
+                if old.public().dh != Bundle.from_dict(entry["bundle"]).dh:
+                    raise CryptoError("an old key does not match its public keys")
+                identities.append(old)
+        except (KeyError, TypeError) as error:
             raise CryptoError("the key file is damaged") from error
-        if identity.public().dh != self.public_bundle().dh:
-            raise CryptoError("the key file does not match its public keys")
-        return identity
+        return identities
+
+    def unlock(self, passphrase: str) -> Identity:
+        return self.unlock_all(passphrase)[0]
+
+    def rotate(self, passphrase: str) -> tuple[Identity, list[Identity], str, dict]:
+        """Replace my identity with a fresh one, keeping the old ones so earlier messages stay readable.
+
+        Returns (new identity, older identities, new recovery code, backup to upload)."""
+        current = self.unlock_all(passphrase)
+        fresh, code = Identity.generate(), e2ee.new_recovery_code()
+        everything = [fresh] + current[:MAX_PREVIOUS_IDENTITIES]
+        self.save_identities(everything, passphrase)
+        return fresh, everything[1:], code, e2ee.make_backup(everything, code)
 
     def public_bundle(self) -> Bundle:
         try:
@@ -87,12 +114,12 @@ class KeyStore:
 
     def restore(self, recovery_code: str, backup: dict, new_passphrase: str) -> Identity:
         """Bring keys back on a new computer from the server's backup and your recovery code."""
-        identity = e2ee.open_backup(backup, recovery_code)
-        self.save_identity(identity, new_passphrase)
-        return identity
+        identities = e2ee.open_backup_all(backup, recovery_code)
+        self.save_identities(identities, new_passphrase)
+        return identities[0]
 
     def change_passphrase(self, old: str, new: str) -> None:
-        self.save_identity(self.unlock(old), new)
+        self.save_identities(self.unlock_all(old), new)
 
     def reset(self) -> None:
         """Forget my keys and everyone I pinned (their keys stay valid; mine are being replaced)."""

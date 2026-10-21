@@ -42,6 +42,26 @@ def main():
     print(f"seal a 200-byte message                       {timed(lambda: e2ee.seal(text, alice, bob_pub.dh, aad)):8.3f} ms")
     print(f"open it                                       {timed(lambda: e2ee.open_sealed(envelope, bob, alice.public(), aad)):8.3f} ms")
     print(f"safety number (5200 SHA-512 rounds)           {timed(lambda: e2ee.safety_number('alice', alice.public(), 'bob', bob_pub)):8.2f} ms")
+    pair = e2ee.encrypt_message(text, alice, "alice", {"bob": bob_pub})
+    print(f"encrypt for one person (key sealed twice)     {timed(lambda: e2ee.encrypt_message(text, alice, 'alice', {'bob': bob_pub})):8.3f} ms")
+    print(f"decrypt it                                    {timed(lambda: e2ee.decrypt_message(pair, bob, 'bob', 'alice', alice.public())):8.3f} ms")
+    from e2ee_group import RoomKeys
+    room_a, room_b = RoomKeys(alice, "alice"), RoomKeys(bob, "bob")
+    room_b.accept_envelope("alice", [alice.public()], room_a.key_envelope("bob", bob_pub, 1, 0))
+    group = room_a.encrypt(text, 1, 100)
+    print(f"room message, sender (chain at number 100)    {timed(lambda: room_a.encrypt(text, 1, 100)):8.3f} ms")
+    print(f"room message, receiver                        {timed(lambda: room_b.decrypt(group, 'alice', [alice.public()])):8.3f} ms")
+    print(f"walk a chain forward 1000 steps               {timed(lambda: e2ee.chain_advance(b'k' * 32, 1000)):8.3f} ms")
+    print(f"seal a chain key for one member               {timed(lambda: room_a.key_envelope('bob', bob_pub, 1, 100)):8.3f} ms")
+    folder = tempfile.mkdtemp()
+    source, target, out = (os.path.join(folder, n) for n in ("p", "c", "o"))
+    with open(source, "wb") as handle:
+        handle.write(os.urandom(20 * 1024 * 1024))
+    key = e2ee.new_file_key()
+    enc_ms = timed(lambda: e2ee.encrypt_file(source, target, key), runs=3)
+    dec_ms = timed(lambda: e2ee.decrypt_file(target, out, key, 20 * 1024 * 1024), runs=3)
+    print(f"encrypt a 20 MB file                          {enc_ms:8.1f} ms  ({20 * 1000 / enc_ms:.0f} MB/s)")
+    print(f"decrypt a 20 MB file                          {dec_ms:8.1f} ms  ({20 * 1000 / dec_ms:.0f} MB/s)")
 
 
 if __name__ == "__main__":

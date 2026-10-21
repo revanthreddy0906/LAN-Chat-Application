@@ -143,6 +143,9 @@ class App:
         self.media = MediaManager(self)
         self.e2ee = E2EEManager(self)
         self._private_send_busy = False
+        self.lock_minutes = int(self.settings.get("lock_minutes", 15) or 0)  # 0 = never lock by itself
+        self.lock_cover: tk.Frame | None = None
+        self._hidden_windows: list[tk.Toplevel] = []
         self.session_token: str | None = None
         self.admin_console: AdminConsole | None = None
         self._password_dialog: dict | None = None
@@ -1242,6 +1245,13 @@ class App:
         menu = tk.Menu(self.root, tearoff=0)
         menu.add_command(label="Change password…", command=self.change_password_dialog)
         menu.add_command(label="Encryption keys…", command=self.e2ee.open_keys)
+        if self.e2ee.state == "ready":
+            menu.add_command(label="Lock now", command=self.lock_screen)
+            auto = tk.Menu(menu, tearoff=0)
+            for minutes, label in ((0, "Never"), (5, "After 5 minutes"), (15, "After 15 minutes"), (30, "After 30 minutes")):
+                auto.add_command(label=("✓ " if self.lock_minutes == minutes else "   ") + label,
+                                 command=lambda m=minutes: self.set_lock_minutes(m))
+            menu.add_cascade(label="Auto-lock", menu=auto)
         menu.add_command(label="Download my data…", command=self.export_data)
         if can(self.my_role() or "member", "manage_users"):
             menu.add_separator()
@@ -1249,6 +1259,58 @@ class App:
         x = self.menu_button.winfo_rootx()
         y = self.menu_button.winfo_rooty() + self.menu_button.winfo_height()
         menu.tk_popup(x, y)
+
+    # ----- app lock: hide everything and forget the keys until the passphrase is entered
+
+    def set_lock_minutes(self, minutes: int) -> None:
+        self.lock_minutes = minutes
+        self.settings.set("lock_minutes", minutes)
+
+    def lock_screen(self) -> None:
+        if self.lock_cover is not None or not self.e2ee.lock():
+            return
+        for child in self.root.winfo_children():  # dialogs and consoles must not stay readable
+            if isinstance(child, tk.Toplevel) and child.winfo_viewable():
+                child.withdraw()
+                self._hidden_windows.append(child)
+        p, f = self.p, self.f
+        cover = self.lock_cover = tk.Frame(self.root, bg=p["bg"])
+        cover.place(x=0, y=0, relwidth=1, relheight=1)
+        box = tk.Frame(cover, bg=p["bg"])
+        box.place(relx=0.5, rely=0.45, anchor="center")
+        tk.Label(box, text="\U0001F512  Locked", bg=p["bg"], fg=p["text"], font=f.title).pack(pady=(0, 6))
+        tk.Label(box, text="Enter your encryption passphrase to continue.", bg=p["bg"], fg=p["muted"],
+                 font=f.body).pack(pady=(0, 10))
+        entry = tk.Entry(box, show="•", width=34, font=f.body)
+        entry.pack(pady=(0, 6))
+        message = tk.Label(box, text="", bg=p["bg"], fg=p["error"], font=f.small)
+        message.pack()
+
+        def unlock(_event=None) -> None:
+            if self.e2ee.try_unlock(entry.get()):
+                self.unlock_screen()
+            else:
+                message.configure(text="That is not the right passphrase.")
+                entry.delete(0, "end")
+
+        entry.bind("<Return>", unlock)
+        self.button(box, "Unlock", unlock, pady=6).pack(pady=(8, 0))
+        cover.lift()
+        entry.focus_set()
+        self.lock_widgets = {"entry": entry, "message": message, "unlock": unlock}
+
+    def unlock_screen(self) -> None:
+        if self.lock_cover is not None:
+            self.lock_cover.destroy()
+            self.lock_cover = None
+        for window in self._hidden_windows:
+            try:
+                window.deiconify()
+            except tk.TclError:
+                pass
+        self._hidden_windows = []
+        self.last_activity = time.monotonic()
+        self.message_entry.focus()
 
     def open_admin(self) -> None:
         if not can(self.my_role() or "member", "manage_users"):
@@ -1418,6 +1480,9 @@ class App:
             if should_go_away(now - self.last_activity, self.away, self.away_after):
                 self.away = True
                 self._send_event({"t": "presence", "status": "away"})
+            if (self.lock_minutes and self.lock_cover is None and self.e2ee.state == "ready"
+                    and now - self.last_activity > self.lock_minutes * 60):
+                self.lock_screen()
         self.root.after(1000, self._tick)
 
     # ----- message actions (right-click menu, reaction pills, reply quotes)
@@ -1727,6 +1792,8 @@ class App:
         if self.sender is not None and self.session_token:
             self._send_event({"t": "logout"})  # revoke the saved sign-in on the server
         self.session_token = None
+        if self.lock_cover is not None:
+            self.unlock_screen()
         self.e2ee.forget()
         if self.admin_console is not None:
             self.admin_console.close()

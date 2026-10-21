@@ -57,7 +57,7 @@ harishgoudbit@cbit.ac.in & revanth252017@gmail.com & saarthakmanocha10@gmail.com
 \maketitle
 
 \begin{abstract}
-A local-area chat application looks trivial from the user's side, yet it forces a designer to solve several networking and security problems at once: recovering message boundaries from a byte stream, serving many clients concurrently, distributing each message to a group, surviving abnormal disconnections, and deciding whom to trust. The literature that addresses these problems is large but fragmented: transport standards describe the byte stream, server-architecture research compares threads with events, messaging standards such as IRC, XMPP, MQTT and WebSocket each fix one design point, and work on reliable groups and secure messaging studies guarantees far stronger than a small system needs. This paper surveys that literature through the lens of a concrete artifact, LANChat-H, a chat system whose core uses only the Python standard library. One TCP server runs a handler thread and a bounded outbound queue with a writer thread per client; messages travel in length-prefixed frames carrying either plain text or versioned JSON events; connections are protected by TLS with trust-on-first-use certificate pinning, memory-hard password hashing, role checks, login lockout and rate limits; history is stored in SQLite; files move over separate, ticket-authorised connections and are verified by SHA-256; and administrative actions are recorded in a hash-chained audit log. On a single laptop over loopback, median delivery latency stayed between 2.7 and 5.8 ms for up to 100 receivers; when one receiver stopped reading, a sequential-relay baseline stopped delivering to all others after about 232 messages whereas the bounded-queue server delivered all 6000 of 6000; and the code base is covered by 343 automated tests and 205 scripted checks that drive the real window and the terminal client. Key management for end-to-end encryption is implemented; encrypting message bodies, forward secrecy and an asynchronous server variant remain future work.
+A local-area chat application looks trivial from the user's side, yet it forces a designer to solve several networking and security problems at once: recovering message boundaries from a byte stream, serving many clients concurrently, distributing each message to a group, surviving abnormal disconnections, and deciding whom to trust. The literature that addresses these problems is large but fragmented: transport standards describe the byte stream, server-architecture research compares threads with events, messaging standards such as IRC, XMPP, MQTT and WebSocket each fix one design point, and work on reliable groups and secure messaging studies guarantees far stronger than a small system needs. This paper surveys that literature through the lens of a concrete artifact, LANChat-H, a chat system whose core uses only the Python standard library. One TCP server runs a handler thread and a bounded outbound queue with a writer thread per client; messages travel in length-prefixed frames carrying either plain text or versioned JSON events; connections are protected by TLS with trust-on-first-use certificate pinning, memory-hard password hashing, role checks, login lockout and rate limits; history is stored in SQLite; files move over separate, ticket-authorised connections and are verified by SHA-256; and administrative actions are recorded in a hash-chained audit log. On a single laptop over loopback, median delivery latency stayed between 2.7 and 5.8 ms for up to 100 receivers; when one receiver stopped reading, a sequential-relay baseline stopped delivering to all others after about 232 messages whereas the bounded-queue server delivered all 6000 of 6000; private messages, files and, when an administrator switches it on, the group room are end-to-end encrypted with audited primitives (X25519, Ed25519, ChaCha20-Poly1305), so that the server stores only ciphertext, which a test confirms by scanning every frame the server handles and its database, and encrypting a message costs about 0.3 ms; and the code base is covered by 452 automated tests and 370 scripted checks that drive the real window and the terminal client. Forward secrecy, protection of metadata and an asynchronous server variant remain future work.
 \end{abstract}
 
 \begin{IEEEkeywords}
@@ -195,7 +195,7 @@ Flash \cite{flash} & TCP (web) & HTTP & Client--server & N/A & N/A & Web workloa
 SEDA \cite{seda} & TCP (services) & Application-defined & Staged pipeline & N/A & N/A & Targets far larger loads than a classroom chat \\
 Threads vs.\ events \cite{ousterhout,vonbehren,krohn} & TCP & N/A & N/A & N/A & N/A & Position papers, not chat-specific \\
 Reliable groups \cite{birman87,birman93} & Reliable channels & N/A & Process groups & N/A & Varies & Guarantees far beyond a demonstration system \\
-\textbf{LANChat-H (this work)} & \textbf{TCP + TLS} & \textbf{4-byte length + text or JSON events} & \textbf{Central relay} & \textbf{TLS with pinning, scrypt, roles, audit} & \textbf{SQLite} & \textbf{Single server; message bodies not yet end-to-end encrypted (Sec.~VII)} \\
+\textbf{LANChat-H (this work)} & \textbf{TCP + TLS} & \textbf{4-byte length + text or JSON events} & \textbf{Central relay} & \textbf{TLS with pinning, scrypt, roles, audit, end-to-end encryption} & \textbf{SQLite} & \textbf{Single server; no forward secrecy; metadata visible to the server (Sec.~VII)} \\
 \bottomrule
 \end{tabularx}
 \end{table*}
@@ -236,10 +236,10 @@ LANChat-H (Section~V) is built around the premise that these gaps share one root
 %======================================================================
 \section{LANChat-H: The Reference Implementation}
 %======================================================================
-LANChat-H is the case-study system. It began as a minimal command-line relay (a TCP server, one thread per client, a four-byte length prefix and plaintext broadcast, with three tests) and was extended in stages, each independently testable. This section states what the current source code does; Section~VI measures it. The core uses only the Python standard library \cite{pysocket,pythreading,pystruct,pyssl}. The standard-library modules \code{sqlite3} and \code{hashlib} supply storage and scrypt \cite{pysqlite,pyhashlib}, and \code{tkinter} supplies the desktop window. Three third-party packages are optional: \code{cryptography} for end-to-end key management, Pillow for some picture previews and \code{sounddevice} for voice recording.
+LANChat-H is the case-study system. It began as a minimal command-line relay (a TCP server, one thread per client, a four-byte length prefix and plaintext broadcast, with three tests) and was extended in stages, each independently testable. This section states what the current source code does; Section~VI measures it. The core uses only the Python standard library \cite{pysocket,pythreading,pystruct,pyssl}. The standard-library modules \code{sqlite3} and \code{hashlib} supply storage and scrypt \cite{pysqlite,pyhashlib}, and \code{tkinter} supplies the desktop window. Three third-party packages are optional: \code{cryptography} for end-to-end encryption, Pillow for some picture previews and \code{sounddevice} for voice recording.
 
 \subsection{Architecture}
-Fig.~\ref{fig:arch} shows the structure. The server owns membership, persistence and policy; clients are thin. In total the non-graphical code is about 4,400 lines in 20 modules, the window about 3,900 lines in seven modules, and key management about 400 lines. Table~\ref{tab:mapping} maps modules to the concepts surveyed earlier.
+Fig.~\ref{fig:arch} shows the structure. The server owns membership, persistence and policy; clients are thin. In total the non-graphical code is about 4,800 lines in 21 modules, the window about 4,900 lines in seven modules, and the end-to-end encryption code about 900 lines in three modules. Table~\ref{tab:mapping} maps modules to the concepts surveyed earlier.
 
 \begin{figure}[t]
 \centering
@@ -276,12 +276,12 @@ Fig.~\ref{fig:arch} shows the structure. The server owns membership, persistence
 \textbf{Component} & \textbf{Concept} & \textbf{Role in the system} & \textbf{Boundary / not provided} \\
 \midrule
 \code{protocol.py}, \code{events.py} & Record recovery; typed events & 4-byte network-order length, exact-read loop, 4096-byte limit; JSON events with a type field, plus a renderer that turns any event into a plain line for old clients & No acknowledgements or sequence numbers on the wire \\
-\code{server.py}, \code{server\_admin.py}, \code{server\_keys.py} & Accept, membership, fan-out, policy & Handler thread and bounded outbox with writer thread per client; handshake; history, search, pins; ticketed file transfer; admin and key-directory events & Single server; no failover; one thread per client \\
+\code{server.py}, \code{server\_admin.py}, \code{server\_keys.py}, \code{server\_room.py} & Accept, membership, fan-out, policy & Handler thread and bounded outbox with writer thread per client; handshake; history, search, pins; ticketed file transfer; admin and key-directory events & Single server; no failover; one thread per client \\
 \code{store.py}, \code{accounts.py}, \code{permissions.py} & Persistence, credentials, roles & SQLite with six numbered migrations, FTS5 search with \code{LIKE} fallback; scrypt hashes; admin, member and guest roles checked on the server & One connection behind a lock; not a clustered database \\
 \code{security.py}, \code{audit.py} & Abuse resistance; accountability & Lockout with backoff, token-bucket rate limits, connection and sign-up caps, password rules; hash-chained audit log & In-memory counters reset on restart \\
 \code{storage.py}, \code{transfer.py} & Bulk transfer & Content-addressed blob store, name sanitising, blocked types, streaming SHA-256 verification & Files are not encrypted at rest on the host \\
 \code{chat\_core.py}, \code{certs.py}, \code{discovery.py} & Client handshake, TLS trust, discovery & Login, certificate pinning by SHA-256 fingerprint, self-signed certificate creation, UDP broadcast discovery & Discovery works within one broadcast domain \\
-\code{e2ee.py}, \code{keystore.py} & End-to-end key management & Identity keys, passphrase-wrapped key file, recovery code, safety numbers, pinned contacts, sealed-message primitive & Message bodies are not yet sent encrypted (Sec.~VII) \\
+\code{e2ee.py}, \code{e2ee\_group.py}, \code{keystore.py} & End-to-end encryption & Identities, passphrase-wrapped key file, recovery code, safety numbers, pinned contacts, sealed messages and files, the room's key chains & No forward secrecy; the server still sees metadata (Sec.~VII) \\
 \code{gui\_*.py}, \code{client.py}, \code{chat.py}, \code{admin\_cli.py} & Interface & Desktop window, terminal client, single launcher, offline admin tool & Terminal client lacks edits, reactions, search and pictures \\
 \bottomrule
 \end{tabularx}
@@ -314,7 +314,11 @@ Privilege abuse & One permission table; every action checked on the server; the 
 Password kept in memory & After sign-in the window keeps a random token (12 h), stored on the server only as a SHA-256 hash, revoked on leave, password change, disable or reset. \\
 Hostile files & Names reduced to a base name; files stored under their SHA-256; executable types blocked; size and space limits enforced while streaming; hash checked on upload and on download; tickets are single-use, expire in 60 s and are limited per person. \\
 Disputed history & Audit log of sign-ins, failures, lockouts, role changes, deletions of others' messages, uploads, resets and settings, each row hashed with its predecessor; a head marker detects truncation; message text is never logged. \\
-Server reading private chats & Key lifecycle implemented (Sec.~V-G); encryption of message bodies is future work. \\
+The host reading chats and files & End-to-end encryption of private messages, files and (optionally) the group room: the server stores ciphertext and public keys only (Sec.~V-G). \\
+A fake key from the server & Self-signed key bundles, pinning on first sight, sending blocked after a change until accepted, sixty-digit safety numbers. \\
+Replays and forged senders & Every encrypted message is signed and bound to its sender and recipients (or epoch and number); the window flags reused ids and numbers. \\
+A removed member & A new key epoch for the room, whose keys the removed person never receives. \\
+An unattended window & Auto-lock after an idle time covers the window and forgets the keys. \\
 \bottomrule
 \end{tabularx}
 \end{table*}
@@ -325,8 +329,14 @@ Messages, users, reactions, pins, read markers, sessions and the audit log live 
 \subsection{Bulk Transfer}
 Pictures, documents and audio do not travel on the chat connection. The client sends an upload request with the name, size and SHA-256; the server checks role, type, size, quota and conversation and replies with a one-time ticket. The client opens a second TLS connection, presents the ticket, and streams raw bytes; the server writes them to a temporary file while hashing, enforces the declared size and a deadline, compares the digest, and only then moves the file into place under its hash and posts the message. Downloads mirror this and are verified by the receiver; a damaged file is never delivered, and a half-finished upload leaves nothing behind. Identical content is stored once, and a file is removed when the last message referring to it is deleted.
 
-\subsection{End-to-End Key Management}
-Each person has an X25519 key pair for key agreement and an Ed25519 pair for signing, bound by a self-signature \cite{rfc7748,rfc8032}. Secret keys are wrapped on disk with ChaCha20-Poly1305 \cite{rfc8439} under a key derived by scrypt from a passphrase. A 24-character recovery code (about 119 bits) wraps a second copy that the server stores as an opaque backup; because the code is high entropy the server cannot usefully guess it, and a test confirms that neither the keys nor the code appear in the database file. The server keeps only public keys and cannot be trusted to report them honestly, so clients verify each bundle's signature, pin the first key seen for each contact, warn when it changes, and offer a sixty-digit safety number computed from both identities. The code also implements the per-message construction (ephemeral and static X25519, HKDF-SHA256 \cite{rfc5869}, ChaCha20-Poly1305, Ed25519 signature) with tests for tampering, wrong recipient and forgery, but message bodies are not yet sent through it.
+\subsection{End-to-End Encryption}
+Each person has an X25519 key pair for key agreement and an Ed25519 pair for signing, bound by a self-signature \cite{rfc7748,rfc8032}. Secret keys are wrapped on disk with ChaCha20-Poly1305 \cite{rfc8439} under a key derived by scrypt from a passphrase. A 24-character recovery code (about 119 bits) wraps a second copy that the server stores as an opaque backup; because the code is high entropy the server cannot usefully guess it, and a test confirms that neither the keys nor the code appear in the database file. The server keeps only public keys and cannot be trusted to report them honestly, so clients verify each bundle's signature, pin the first key seen for each contact, block sending when it changes until the person has accepted the new one, and offer a sixty-digit safety number computed from both identities.
+
+\textbf{Private messages.} The sender encrypts the text once under a random key with ChaCha20-Poly1305, seals that key separately for the recipient and for themselves (ephemeral and static X25519 through HKDF-SHA256 \cite{rfc5869}), and signs the whole message with Ed25519, binding the sender and recipients into the associated data. The server checks only the shape and the two names, stores an empty body and the envelope, and relays it. Tampering, a wrong recipient or a forged sender fails to open, and the window flags a reused random message id as a possible replay. \textbf{Files} are encrypted on the sender's computer in 64 KiB chunks under a random key; each nonce carries the chunk number and a last-chunk flag, so dropped, reordered or added chunks fail. The key, the real name and the type travel inside the encrypted message, so the server stores unreadable bytes under an opaque name, and the receiving window, which alone knows the name, warns before opening a program-like file.
+
+\textbf{The group room.} When an administrator turns it on, the room uses sender keys in the style of group messengers \cite{rfc9420}: each member holds a random chain key per epoch, derives each message key by a one-way step, and gives every other member a sealed copy of the chain as it stands, so a member who joins later reads only what follows. The server stores the sealed copies, enforces the current epoch and increasing message numbers, and starts a new epoch whenever someone is removed or an administrator asks, so the removed person never receives the new keys. Mentions are named by the sender because the server cannot read the text; pins, quoted replies and search use what the window has decrypted.
+
+\textbf{Key lifecycle.} Keys can be rotated (a new identity, with the old ones kept so earlier messages still open) or restored from the recovery code on a new computer, and an idle window locks itself, covering the interface and forgetting the keys until the passphrase is entered.
 
 \subsection{Status of the Staged Hardening Path}
 The system was hardened in the order shown in Table~\ref{tab:stages}. The only stage not carried out is the asynchronous variant, so the threaded design has not been compared with an \code{asyncio} server.
@@ -344,7 +354,7 @@ The system was hardened in the order shown in Table~\ref{tab:stages}. The only s
 2. Protocol structure & Done: typed JSON events, version negotiation, text compatibility for old clients \\
 3. Security and identity & Done: TLS with pinning, scrypt credentials, roles, lockout, rate limits, audit log \\
 4. Asynchronous variant & Not done; listed as future work \\
-Beyond the plan & Persistence, file transfer, administration, key management \\
+Beyond the plan & Persistence, file transfer, administration, end-to-end encryption \\
 \bottomrule
 \end{tabularx}
 \end{table}
@@ -355,7 +365,7 @@ Beyond the plan & Persistence, file transfer, administration, key management \\
 All measurements were taken on one machine: an Apple-silicon laptop (arm64) running macOS 27.0.1 with CPython 3.13.9, with the server and clients on the loopback interface. The source code, tests and scripts (\code{bench/}) are published \cite{lanchatrepo}, and the numbers below are what they printed. Because client and server share one machine, the results show the cost of the software, not of a real network; they are not claims about Wi-Fi or Ethernet performance.
 
 \subsection{Correctness and Security Tests}
-The repository holds 17 test modules that run 343 tests, each starting real servers on free local ports. They cover framing (round trip, closed connection, oversized and zero-length frames), the version-1 and version-2 protocols, the database and its migrations, search and paging, TLS and certificate pinning including a changed certificate, discovery, file transfer (round trips, hash mismatch, cut-off uploads, hostile names, expired and reused tickets, quota, concurrent uploads), lockout, rate limits, password rules, saved sign-ins, administrator actions, tamper detection in the audit chain, and the key-management code, which is checked against published test vectors for X25519 and Ed25519 \cite{rfc7748,rfc8032}. A further seven scripts drive the real window and the terminal client through 205 checks, including a run with every security default on. All of them pass.
+The repository holds 22 test modules that run 452 tests, each starting real servers on free local ports. They cover framing (round trip, closed connection, oversized and zero-length frames), the version-1 and version-2 protocols, the database and its migrations, search and paging, TLS and certificate pinning including a changed certificate, discovery, file transfer (round trips, hash mismatch, cut-off uploads, hostile names, expired and reused tickets, quota, concurrent uploads), lockout, rate limits, password rules, saved sign-ins, administrator actions, tamper detection in the audit chain, and the encryption code, which is checked against published test vectors for X25519 and Ed25519 \cite{rfc7748,rfc8032} and then against tampering, wrong recipients, forged senders, replays, damaged and reordered files, and the room's rules for late joiners, removal and message numbering. One test wraps the server's send and receive functions, records every frame the server handles, and scans those frames, the database file and the stored files for the secret text, file names, file contents and file keys of encrypted messages; a companion check shows that the same capture would reveal a plaintext message. A further eleven scripts drive the real window and the terminal client through 370 checks, including runs with every security default on. All of them pass.
 
 \subsection{Fan-Out Latency}
 One sender sent 100 messages of about 100 bytes at ten per second to $N$ receivers, each a real client with its own connection; every message was also written to the SQLite database before delivery. Receivers ran in separate processes of at most 20, and latency is the arrival time minus the send time on the machine's monotonic clock. Table~\ref{tab:fanout} shows that every message reached every receiver. Median latency stayed between 2.7 and 5.8 ms and the 95th percentile below 9.5 ms without TLS; with TLS the figures for 25 and 100 receivers were 4.7 and 6.4 ms (median) and 7.5 and 11.3 ms (95th percentile).
@@ -437,7 +447,7 @@ Table~\ref{tab:xfer} gives the median of three runs for uploading and then downl
 \end{table}
 
 \subsection{Cost of Security Operations}
-Table~\ref{tab:cost} lists the median time of single operations. A password check costs about 29 ms by design: it is the price of making offline guessing expensive. Per-message sealing and opening cost well under a millisecond, so the cost of end-to-end encryption would be dominated by key management rather than by the cipher.
+Table~\ref{tab:cost} lists the median time of single operations. A password check costs about 27 ms by design: it is the price of making offline guessing expensive. Encrypting a message for one person (a random key sealed twice and a signature) takes about 0.3 ms and decrypting it 0.26 ms, a room message under 0.3 ms, and a 20 MB file is encrypted in about 31 ms and decrypted in about 23 ms (roughly 650 and 850 MB/s). The cost of end-to-end encryption is therefore dominated by passphrase stretching and key management, not by the ciphers, and the server's own work is unchanged: it relays the same frames.
 
 \begin{table}[t]
 \centering
@@ -448,12 +458,16 @@ Table~\ref{tab:cost} lists the median time of single operations. A password chec
 \toprule
 \textbf{Operation} & \textbf{Time (ms)} \\
 \midrule
-Password check (scrypt $n=2^{14}$) & 28.6 \\
-Wrap secret keys with a passphrase (scrypt $n=2^{15}$) & 59.0 \\
+Password check (scrypt $n=2^{14}$) & 27.3 \\
+Wrap secret keys with a passphrase (scrypt $n=2^{15}$) & 57.7 \\
 Generate an identity (X25519 and Ed25519) & 0.05 \\
-Seal a 200-byte message & 0.12 \\
-Open it & 0.17 \\
-Safety number (5200 SHA-512 rounds) & 2.0 \\
+Safety number (5200 SHA-512 rounds) & 2.1 \\
+Encrypt a 200-byte message for one person & 0.31 \\
+Decrypt it & 0.26 \\
+Room message: encrypt / decrypt & 0.17 / 0.26 \\
+Seal a chain key for one member & 0.25 \\
+Walk a room chain forward 1000 steps & 1.3 \\
+Encrypt / decrypt a 20 MB file & 30.7 / 23.4 \\
 \bottomrule
 \end{tabularx}
 \end{table}
@@ -464,9 +478,11 @@ The experiments use one machine, one Python version and the loopback interface, 
 %======================================================================
 \section{Limitations and Future Work}
 %======================================================================
-\textbf{Message bodies are not yet end-to-end encrypted.} The server can read every message and, unless added later, every file. The key lifecycle and the sealing primitive exist and are tested, but the send path does not use them, so private conversations are protected from the network by TLS and not from the host. The planned design encrypts private messages first, then files, then the group room using sender keys with re-keying when membership changes.
+\textbf{No forward secrecy.} Private messages use an ephemeral key per message, which protects the sender's side, but theft of a recipient's long-term key would expose earlier messages to anyone holding the ciphertext, and the room's sealed chain copies stay on the server so that history can be re-read. A ratchet \cite{signal,cohngordon} would be the upgrade, at the cost of storing per-device state.
 
-\textbf{No forward secrecy in the planned first design.} A per-message ephemeral key protects the sender side, but theft of a recipient's long-term key would expose earlier messages to anyone holding the ciphertext; a ratchet \cite{signal,cohngordon} would be the upgrade.
+\textbf{Identity is as strong as the comparison.} Keys are pinned on first sight and a change blocks sending, but until two people compare security codes a hostile server could have substituted a key at the very first contact.
+
+\textbf{Scope of encryption.} Terminal clients and members without keys cannot take part in encrypted conversations; the server can still withhold or delete messages even though it cannot read or forge them; search of encrypted messages covers what the window has loaded; and files shared in readable conversations are stored unencrypted.
 
 \textbf{Metadata remains visible to the server:} who talks to whom, when, message sizes, reactions and mentions.
 
@@ -481,7 +497,7 @@ The experiments use one machine, one Python version and the loopback interface, 
 %======================================================================
 Taken together, the literature on TCP-based messaging tells a story of solid but scattered progress. Transport standards define a reliable byte stream, framing conventions recover messages from it, server-architecture research explains when threads give way to events, messaging protocols fix particular design points, and group-communication and security work describe guarantees well beyond a demonstration system. What the comparison and gap analysis point to is that no single small artifact walked through all of these decisions together in a form that could be read, tested and measured.
 
-LANChat-H is an attempt to be that artifact. Its length-prefixed framing, versioned events with a text fallback, bounded per-client queues, heartbeats, certificate pinning, memory-hard credentials, throttling, ticketed file transfer and hash-chained audit log were each added in a testable stage, and the measurements show the effects the survey predicts: a sequential relay stops delivering to everyone once one receiver stalls, whereas bounded queues keep the room alive at the cost of a few milliseconds per message. The honest remainder is stated as plainly: message bodies are not yet end-to-end encrypted, no asynchronous variant was compared, and all measurements come from one machine. The next phase is to finish the encrypted send path and to repeat the evaluation across a real network.
+LANChat-H is an attempt to be that artifact. Its length-prefixed framing, versioned events with a text fallback, bounded per-client queues, heartbeats, certificate pinning, memory-hard credentials, throttling, ticketed file transfer, hash-chained audit log and end-to-end encryption of private chats, files and the group room were each added in a testable stage, and the measurements show the effects the survey predicts: a sequential relay stops delivering to everyone once one receiver stalls, whereas bounded queues keep the room alive at the cost of a few milliseconds per message. The honest remainder is stated as plainly: there is no forward secrecy, the server still sees metadata, no asynchronous variant was compared, and all measurements come from one machine. The next phase is to add a ratchet and to repeat the evaluation across a real network.
 
 
 \balance

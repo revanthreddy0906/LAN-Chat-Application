@@ -23,7 +23,7 @@ LAN Chat is one server process and any number of clients, all in Python's standa
 | `events.py` | The v2 event shapes, size trimming, and `legacy_text()` which renders any event as a plain line for v1 clients. |
 | `server.py` | Accept loop, handshake (password, saved sign-in, file connection), per-client threads and outboxes, message posting, history, search, pins, file tickets. |
 | `server_admin.py` | Mixed into the server: change password, sign out, data export, and the admin-only events. |
-| `store.py` | SQLite with numbered migrations v1–v5: users, messages, reactions, read markers, mentions, pins, attachments, sessions, audit. FTS5 search with a `LIKE` fallback. |
+| `store.py` | SQLite with numbered migrations v1–v7: users, messages, reactions, read markers, mentions, pins, attachments, sessions, audit. FTS5 search with a `LIKE` fallback. |
 | `accounts.py` | scrypt hashing, sign-in/registration, password changes. |
 | `permissions.py` | The role table and `can(role, action)`. |
 | `security.py` | `LoginGuard` (lockout with backoff), `RateLimiter`, `SlidingWindow`, `check_password`. |
@@ -33,6 +33,9 @@ LAN Chat is one server process and any number of clients, all in Python's standa
 | `chat_core.py` | Login handshake, trust on first use, heartbeat, helpers shared by both clients. |
 | `gui_*.py` | The Tkinter window: widgets, theme, pure logic, media manager, admin console. |
 | `admin_cli.py` | Offline account and audit tool (`chat.py admin ...`). |
+| `e2ee.py`, `e2ee_group.py`, `keystore.py` | End-to-end encryption: primitives and message formats, the group room's key chains, and the key file with pinned contacts. See [E2EE.md](E2EE.md). |
+| `server_keys.py`, `server_room.py` | The server's public-key directory and the encrypted room's epochs, message numbers and sealed key envelopes (it never holds a secret). |
+| `gui_e2ee.py` | The window's encryption manager: setup, unlock, restore, rotation, verification, sending and opening encrypted messages and files, the room, and the app lock helper. |
 
 ## Concurrency
 

@@ -116,6 +116,29 @@ class RecoveryTest(unittest.TestCase):
         restored = e2ee.open_backup(backup, code.lower())
         self.assertEqual(restored.secret_bytes(), identity.secret_bytes())
 
+    def test_a_backup_can_carry_older_identities_too(self):
+        current, older, oldest = Identity.generate(), Identity.generate(), Identity.generate()
+        code = e2ee.new_recovery_code()
+        backup = e2ee.make_backup([current, older, oldest], code)
+        restored = e2ee.open_backup_all(backup, code)
+        self.assertEqual([i.secret_bytes() for i in restored], [i.secret_bytes() for i in (current, older, oldest)])
+        self.assertEqual(e2ee.open_backup(backup, code).secret_bytes(), current.secret_bytes())
+        self.assertEqual(backup["count"], 3)
+        self.assertLess(len(str(backup)), 1200)
+
+    def test_an_old_single_identity_backup_still_opens(self):
+        identity, code = Identity.generate(), e2ee.new_recovery_code()
+        legacy = {"v": 1, "bundle": identity.public().to_dict(),
+                  "wrapped": e2ee.wrap(identity.secret_bytes(), e2ee.normalize_recovery_code(code), e2ee.BACKUP_AAD)}
+        self.assertEqual(e2ee.open_backup(legacy, code).secret_bytes(), identity.secret_bytes())
+
+    def test_a_backup_that_is_not_whole_identities_is_refused(self):
+        code = e2ee.new_recovery_code()
+        broken = {"v": 2, "bundle": Identity.generate().public().to_dict(),
+                  "wrapped": e2ee.wrap(b"x" * 70, e2ee.normalize_recovery_code(code), e2ee.BACKUP_AAD)}
+        with self.assertRaises(CryptoError):
+            e2ee.open_backup_all(broken, code)
+
     def test_wrong_code_and_swapped_bundle(self):
         identity, code = Identity.generate(), e2ee.new_recovery_code()
         backup = e2ee.make_backup(identity, code)

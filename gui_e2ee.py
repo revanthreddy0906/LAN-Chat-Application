@@ -36,6 +36,7 @@ class E2EEManager:
         self.app = app
         self.state = "off"
         self.identity: Identity | None = None
+        self.old_identities: list[Identity] = []  # kept after a rotation, to open what was sealed to them
         self.store: KeyStore | None = None
         self.policy = "optional"
         self.server_has_keys = False
@@ -95,6 +96,7 @@ class E2EEManager:
     def forget(self) -> None:
         """Leaving the chat locks everything."""
         self.identity = None
+        self.old_identities = []
         self.state = "off" if not e2ee.AVAILABLE else "off"
         self._pending.clear()
         self._login_password = ""
@@ -174,15 +176,17 @@ class E2EEManager:
         if problem:
             raise CryptoError(problem)
         identity, code, backup = self.store.create(passphrase)
-        self.identity, self.state = identity, "ready"
+        self.identity, self.old_identities, self.state = identity, [], "ready"
         self._publish(identity, backup)
         self.app._update_header()
         self.schedule_decrypt()
         self.start_room()
         return code
 
-    def _publish(self, identity: Identity, backup: dict | None = None, callback=None) -> None:
+    def _publish(self, identity: Identity, backup: dict | None = None, callback=None, rotated: bool = False) -> None:
         event = {"t": "keys_publish", **identity.public().to_dict()}
+        if rotated:
+            event["rotated"] = True
         if backup is not None:
             event["backup"] = backup
         self._request(event, callback or (lambda reply: None if reply.get("ok") else self.app.notice(
@@ -190,7 +194,7 @@ class E2EEManager:
 
     def try_unlock(self, passphrase: str) -> bool:
         try:
-            self.identity = self.store.unlock(passphrase)
+            self.identity, *self.old_identities = self.store.unlock_all(passphrase)
         except CryptoError:
             return False
         self.state = "ready"
@@ -226,7 +230,8 @@ class E2EEManager:
                 done(False, "The server has no backup for your account. Start over to make new keys.")
                 return
             try:
-                self.identity = self.store.restore(code, backup, passphrase)
+                self.store.restore(code, backup, passphrase)
+                self.identity, *self.old_identities = self.store.unlock_all(passphrase)
             except CryptoError as error:
                 done(False, str(error))
                 return
@@ -237,6 +242,34 @@ class E2EEManager:
             self.start_room()
             done(True, "")
         self._request({"t": "keys_backup_get"}, got)
+
+    def rotate_keys(self, passphrase: str) -> str:
+        """Make a new identity, keep the old ones for reading earlier messages, and publish the new one.
+
+        Returns the new recovery code (shown once). Raises CryptoError for a wrong passphrase."""
+        fresh, older, code, backup = self.store.rotate(passphrase)
+        previous_room = self.room
+        self.identity, self.old_identities = fresh, older
+        if previous_room is not None:  # keep every chain I hold: they are not tied to the identity
+            carried = RoomKeys(fresh, self.app.username, older)
+            carried.chains, carried.seen = previous_room.chains, previous_room.seen
+            self.room = carried
+        self._publish(fresh, backup, rotated=True)
+        self.app._update_header()
+        self.schedule_decrypt()
+        self.room_sync_soon()
+        return code
+
+    def lock(self) -> bool:
+        """Forget the unlocked keys (the app lock). New messages stay unreadable until the passphrase is entered."""
+        if self.state != "ready" or self.identity is None:
+            return False
+        self.identity, self.old_identities = None, []
+        self.room, self.room_loaded = None, False
+        self.state = "locked"
+        self.app._update_header()
+        self.schedule_decrypt()
+        return True
 
     def reset_keys(self) -> None:
         """Throw away my keys everywhere. Contacts will see that my security code changed."""
@@ -302,7 +335,9 @@ class E2EEManager:
             self.ensure_contacts([name], self.app._update_private_chip)
         if self.store is not None and not event.get("created") and self.store.contact(name):
             self.changed.add(name.lower())
-            what = "reset their encryption keys" if event.get("reset") else "has a new security code"
+            what = ("reset their encryption keys" if event.get("reset")
+                    else "rotated their keys and has a new security code" if event.get("rotated")
+                    else "has a new security code")
             self.app.notice(f"⚠ {name} {what}. Verify it again before trusting new messages "
                             f"(right-click {name} in the member list).")
             self.app._render_users()
@@ -491,7 +526,7 @@ class E2EEManager:
     def _sender_bundles(self, name: str) -> list[Bundle]:
         """The keys to check a sender against: my own, those I pinned (newest first), or at first sight the server's."""
         if name.lower() == self.app.username.lower():
-            return [self.identity.public()]
+            return [self.identity.public(), *(old.public() for old in self.old_identities)]
         fresh = self.bundles.get(name.lower())
         pinned_all = self.store.bundles_for(name)
         if pinned_all:
@@ -555,12 +590,15 @@ class E2EEManager:
                     continue
                 payload, last_error = None, ""
                 for bundle in candidates:
-                    try:
-                        payload = e2ee.decode_payload(e2ee.decrypt_message(
-                            record.enc, self.identity, app.username, record.sender, bundle))
+                    for mine in [self.identity, *self.old_identities]:
+                        try:
+                            payload = e2ee.decode_payload(e2ee.decrypt_message(
+                                record.enc, mine, app.username, record.sender, bundle))
+                            break
+                        except CryptoError as error:
+                            last_error = str(error)
+                    if payload is not None:
                         break
-                    except CryptoError as error:
-                        last_error = str(error)
                 if payload is None:
                     self._fail_record(record, last_error)
                     continue
@@ -627,7 +665,7 @@ class E2EEManager:
         if self.identity is None or not e2ee.AVAILABLE:
             return
         if self.room is None or self.room.identity is not self.identity:
-            self.room, self.room_loaded = RoomKeys(self.identity, self.app.username), False
+            self.room, self.room_loaded = RoomKeys(self.identity, self.app.username, self.old_identities), False
         self.fetch_room_keys(lambda: (self.schedule_decrypt(), self.sync_room() if self.room_active() else None))
 
     def fetch_room_keys(self, done: Callable[[], None] | None = None) -> None:
@@ -909,7 +947,7 @@ class E2EEManager:
         first.focus_set()
         self.setup_widgets = {"first": first, "second": second, "message": message, "create": create, "later": later}
 
-    def _show_recovery(self, body: tk.Frame, code: str, window: tk.Toplevel) -> None:
+    def _show_recovery(self, body: tk.Frame, code: str, window: tk.Toplevel, key: str = "setup") -> None:
         """Step two: the recovery code, shown once. The window cannot be closed until it is confirmed."""
         p, f = self.app.p, self.app.f
         for child in body.winfo_children():
@@ -922,7 +960,7 @@ class E2EEManager:
         shown.pack(fill="x", pady=(2, 8))
         saved = tk.BooleanVar(value=False)
         row = tk.Frame(body, bg=p["bg"])
-        done = self.app.button(row, "Done", lambda: self._close("setup"), pady=6)
+        done = self.app.button(row, "Done", lambda: self._close(key), pady=6)
 
         def toggle() -> None:
             done.set_disabled(not saved.get())
@@ -1073,7 +1111,39 @@ class E2EEManager:
                 self.reset_keys()
 
         app.button(buttons, "Reset keys…", reset, kind="secondary", pady=6).pack(side="left")
+        app.button(buttons, "Rotate keys…", lambda: (self._close("keys"), self.open_rotate()), kind="secondary",
+                   pady=6).pack(side="left", padx=(8, 0))
         app.button(buttons, "Close", lambda: self._close("keys"), pady=6).pack(side="right")
+
+    def open_rotate(self) -> None:
+        """Replace my keys with fresh ones but keep the old ones, so earlier messages stay readable."""
+        made = self._window("rotate", "Rotate your encryption keys")
+        if made is None:
+            return
+        window, body = made
+        p, f = self.app.p, self.app.f
+        self._label(body, "Rotate your encryption keys", font=f.title)
+        self._label(body, "You get new keys and a new recovery code. Everything you could read before stays readable. "
+                          "People you talk to will be told your security code changed and need to accept the new one.")
+        self._label(body, "Enter your passphrase to confirm:", fg=p["muted"])
+        entry = self._entry(body)
+        message = self._label(body, "", fg=p["error"])
+        buttons = tk.Frame(body, bg=p["bg"])
+        buttons.pack(fill="x", pady=(8, 0))
+
+        def rotate() -> None:
+            try:
+                code = self.rotate_keys(entry.get())
+            except CryptoError as error:
+                message.configure(text=str(error))
+                return
+            self._show_recovery(body, code, window, key="rotate")
+
+        entry.bind("<Return>", lambda _e: rotate())
+        self.app.button(buttons, "Rotate keys", rotate, pady=6).pack(side="right")
+        self.app.button(buttons, "Cancel", lambda: self._close("rotate"), kind="secondary", pady=6).pack(side="right", padx=(0, 8))
+        entry.focus_set()
+        self.rotate_widgets = {"entry": entry, "message": message, "rotate": rotate}
 
     def _unlock_from_skipped(self) -> None:
         if self.store is not None and self.store.exists():

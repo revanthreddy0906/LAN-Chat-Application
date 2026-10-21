@@ -75,6 +75,21 @@ class DirectoryTest(KeysTestCase):
         self.assertIn("keys_changed", [r["action"] for r in self.server.store.audit_rows(limit=50)])
         self.assertEqual(self.server.store.get_user_keys(1)["version"], 2)
 
+    def test_a_rotation_is_marked_audited_and_keeps_envelopes(self):
+        alice, bob = self.v2("Alice"), self.v2("Bob")
+        self.publish(alice, Identity.generate())
+        self.server.store.add_envelope(1, 2, 1, "{}")  # an envelope sealed to alice's current key
+        rotated = Identity.generate()
+        alice.send(t="keys_publish", req=5, rotated=True, **rotated.public().to_dict())
+        self.assertEqual(alice.until(lambda e: e["t"] == "keys_result" and e["req"] == 5, limit=300)["status"], "changed")
+        alert = bob.until(lambda e: e["t"] == "key_changed" and not e.get("created"), limit=300)
+        self.assertTrue(alert["rotated"])
+        self.assertEqual(len(self.server.store.envelopes_for(1, 0, 10)), 1)  # kept: she holds her old identity
+        self.assertIn("keys_rotated", [r["action"] for r in self.server.store.audit_rows(limit=30)])
+        alice.send(t="keys_publish", req=6, **Identity.generate().public().to_dict())  # a plain replacement
+        alice.until(lambda e: e["t"] == "keys_result" and e["req"] == 6, limit=300)
+        self.assertEqual(self.server.store.envelopes_for(1, 0, 10), [])  # not claimed as a rotation: cleared
+
     def test_unsigned_or_mismatched_bundles_are_refused(self):
         alice = self.v2("Alice")
         good, other = Identity.generate().public(), Identity.generate().public()

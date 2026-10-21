@@ -72,6 +72,45 @@ class KeyStoreTest(unittest.TestCase):
         with self.assertRaises(WrongPassphrase):
             KeyStore(tempfile.mkdtemp(), "x", "Alice").restore(e2ee.new_recovery_code(), backup, "n")
 
+    def test_rotation_keeps_the_old_identities_and_changes_the_current_one(self):
+        first, _code, _backup = self.store.create("one two three")
+        fresh, older, code, backup = self.store.rotate("one two three")
+        self.assertNotEqual(fresh.public().fingerprint(), first.public().fingerprint())
+        self.assertEqual([i.public().fingerprint() for i in older], [first.public().fingerprint()])
+        unlocked = self.store.unlock_all("one two three")
+        self.assertEqual([i.secret_bytes() for i in unlocked], [fresh.secret_bytes(), first.secret_bytes()])
+        self.assertEqual(self.store.unlock("one two three").secret_bytes(), fresh.secret_bytes())
+        self.assertEqual(self.store.public_bundle(), fresh.public())
+        self.assertEqual(len(e2ee.open_backup_all(backup, code)), 2)
+        with self.assertRaises(WrongPassphrase):
+            self.store.rotate("wrong passphrase")
+        self.assertEqual(len(self.store.unlock_all("one two three")), 2)  # a failed rotation changed nothing
+
+    def test_rotating_many_times_keeps_a_bounded_history(self):
+        self.store.create("pass phrase one")
+        for _ in range(8):
+            self.store.rotate("pass phrase one")
+        self.assertLessEqual(len(self.store.unlock_all("pass phrase one")), 1 + keystore.MAX_PREVIOUS_IDENTITIES)
+
+    def test_a_restore_brings_back_every_identity_and_the_passphrase_can_change(self):
+        self.store.create("first pass")
+        self.store.rotate("first pass")
+        fresh, _older, code, backup = self.store.rotate("first pass")
+        other = KeyStore(tempfile.mkdtemp(), "x", "Alice")
+        other.restore(code, backup, "second pass")
+        self.assertEqual(len(other.unlock_all("second pass")), 3)
+        other.change_passphrase("second pass", "third pass")
+        self.assertEqual(len(other.unlock_all("third pass")), 3)
+        with self.assertRaises(WrongPassphrase):
+            other.unlock_all("second pass")
+
+    def test_the_key_file_with_old_identities_holds_no_plain_secrets(self):
+        first, _c, _b = self.store.create("pass phrase")
+        self.store.rotate("pass phrase")
+        raw = self.store.key_path.read_text()
+        self.assertNotIn(e2ee.b64(first.secret_bytes()), raw)
+        self.assertNotIn("pass phrase", raw)
+
     def test_change_passphrase(self):
         identity, _c, _b = self.store.create("one")
         self.store.change_passphrase("one", "two")

@@ -184,22 +184,35 @@ def valid_recovery_code(code: str) -> bool:
 
 # ----- the backup the server holds for you (opaque to it) -----
 
-def make_backup(identity: Identity, recovery_code: str) -> dict:
-    """Your secret keys wrapped with the recovery code, safe to hand to the server."""
-    return {"v": 1, "bundle": identity.public().to_dict(),
-            "wrapped": wrap(identity.secret_bytes(), normalize_recovery_code(recovery_code), BACKUP_AAD)}
+def make_backup(identities, recovery_code: str) -> dict:
+    """Your secret keys wrapped with the recovery code, safe to hand to the server.
+
+    `identities` is the current identity, or a list with the current one first followed by older
+    ones kept so that messages sealed to them can still be opened."""
+    identities = [identities] if isinstance(identities, Identity) else list(identities)
+    secrets_ = b"".join(identity.secret_bytes() for identity in identities)
+    return {"v": 2, "count": len(identities), "bundle": identities[0].public().to_dict(),
+            "wrapped": wrap(secrets_, normalize_recovery_code(recovery_code), BACKUP_AAD)}
 
 
-def open_backup(backup: dict, recovery_code: str) -> Identity:
+def open_backup_all(backup: dict, recovery_code: str) -> list[Identity]:
+    """Every identity in a backup, current first."""
     if not valid_recovery_code(recovery_code):
         raise WrongPassphrase("a recovery code is 24 letters and digits, like ABCD-EFGH-...")
     try:
-        identity = Identity.from_secret(unwrap(backup["wrapped"], normalize_recovery_code(recovery_code), BACKUP_AAD))
-        if identity.public().dh != Bundle.from_dict(backup["bundle"]).dh:
+        data = unwrap(backup["wrapped"], normalize_recovery_code(recovery_code), BACKUP_AAD)
+        if len(data) == 0 or len(data) % 64:
+            raise CryptoError("the backup is damaged")
+        identities = [Identity.from_secret(data[i:i + 64]) for i in range(0, len(data), 64)]
+        if identities[0].public().dh != Bundle.from_dict(backup["bundle"]).dh:
             raise CryptoError("the backup does not match its public keys")
     except (KeyError, TypeError) as error:
         raise CryptoError("the backup is damaged") from error
-    return identity
+    return identities
+
+
+def open_backup(backup: dict, recovery_code: str) -> Identity:
+    return open_backup_all(backup, recovery_code)[0]
 
 
 # ----- safety numbers -----
