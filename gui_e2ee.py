@@ -434,7 +434,7 @@ class E2EEManager:
             for record in pending:
                 if record.secure != "locked":
                     record.secure = "locked"
-                    record.text = "\U0001F512 Encrypted message. Unlock your keys (⋯ → Encryption keys…) to read it."
+                    record.text = "" if record.att else "\U0001F512 Encrypted message · keys locked"
                     self.app.messages.refresh(record)
             return
         names = {r.sender for r in pending}
@@ -587,7 +587,9 @@ class E2EEManager:
                           "opened on theirs. Not even the person hosting this chat can read them.")
         self._label(body, f"Choose a passphrase for the keys on this computer ({MIN_PASSPHRASE}+ characters):",
                     fg=p["muted"])
-        first, second = self._entry(body), self._entry(body)
+        first = self._entry(body)
+        self._label(body, "Type it again to be sure:", fg=p["muted"])
+        second = self._entry(body)
         message = self._label(body, "", fg=p["error"])
         buttons = tk.Frame(body, bg=p["bg"])
         buttons.pack(fill="x", pady=(8, 0))
@@ -627,7 +629,8 @@ class E2EEManager:
                          padx=14, pady=12, relief="flat")
         shown.pack(fill="x", pady=(2, 8))
         saved = tk.BooleanVar(value=False)
-        done = self.app.button(body, "Done", lambda: self._close("setup"), pady=6)
+        row = tk.Frame(body, bg=p["bg"])
+        done = self.app.button(row, "Done", lambda: self._close("setup"), pady=6)
 
         def toggle() -> None:
             done.set_disabled(not saved.get())
@@ -640,9 +643,8 @@ class E2EEManager:
                                bg=p["bg"], fg=p["text"], selectcolor=p["card"], activebackground=p["bg"],
                                font=f.body, anchor="w")
         check.pack(fill="x")
-        row = tk.Frame(body, bg=p["bg"])
         row.pack(fill="x", pady=(10, 0))
-        done.pack(in_=row, side="right")
+        done.pack(side="right")
         self.app.button(row, "Copy", copy, kind="secondary", pady=6).pack(side="right", padx=(0, 8))
         done.set_disabled(True)
         window.protocol("WM_DELETE_WINDOW", lambda: None)  # must confirm first
@@ -696,7 +698,9 @@ class E2EEManager:
                           "computer. Enter the recovery code you saved when you set them up.")
         code = self._entry(body, show="")
         self._label(body, f"Then choose a passphrase for this computer ({MIN_PASSPHRASE}+ characters):", fg=p["muted"])
-        first, second = self._entry(body), self._entry(body)
+        first = self._entry(body)
+        self._label(body, "Type it again to be sure:", fg=p["muted"])
+        second = self._entry(body)
         message = self._label(body, "", fg=p["error"])
         buttons = tk.Frame(body, bg=p["bg"])
         buttons.pack(fill="x", pady=(8, 0))

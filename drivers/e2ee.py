@@ -33,6 +33,10 @@ w["create"]()
 root.update()
 r = manager.recovery_widgets
 check("the recovery code is shown once", e2ee.valid_recovery_code(r["code"]) and manager.state == "ready")
+root.update()
+button = r["done"]
+check("the Done button is really visible, not hidden behind another widget",
+      button.winfo_ismapped() and root.winfo_containing(button.winfo_rootx() + 5, button.winfo_rooty() + 5) is button)
 check("Done is locked until the code is confirmed", r["done"].cget("state") == "disabled" or r["done"]._disabled)
 r["saved"].set(True); r["toggle"]()
 check("ticking the box enables Done", not r["done"]._disabled)

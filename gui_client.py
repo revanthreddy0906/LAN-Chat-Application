@@ -1526,7 +1526,9 @@ class App:
             sender=event["sender"], ts=event["ts"],
             enc=event.get("enc"), secure="pending" if event.get("enc") else "",
         )
-        body = "\U0001F512 Encrypted message" if event.get("enc") else event["body"]
+        body = event["body"]
+        if event.get("enc"):  # a file message is shown as a card, so it needs no placeholder text
+            body = "" if event.get("att") else "\U0001F512 Encrypted message"
         if event.get("to"):
             return Record("private", body, name=event["to"] if mine else event["sender"], **common)
         return Record("chat", body, name=event["sender"], **common)

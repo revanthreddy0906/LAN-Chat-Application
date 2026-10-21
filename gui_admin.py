@@ -30,7 +30,7 @@ class AdminConsole:
         self.p = app.p
         self.window = tk.Toplevel(app.root)
         self.window.title("Admin console")
-        self.window.geometry("860x560")
+        self.window.geometry(f"860x560+{app.root.winfo_rootx() + 40}+{app.root.winfo_rooty() + 40}")
         self.window.minsize(720, 480)
         self.window.configure(bg=self.p["bg"])
         self.window.protocol("WM_DELETE_WINDOW", self.close)
@@ -265,7 +265,7 @@ class AdminConsole:
         row("End-to-end encryption", lambda f: ttk.Combobox(f, values=["off", "optional", "required"], width=10, state="readonly",
                                                          textvariable=self.setting_vars["e2ee_policy"]),
             "required = private messages must be encrypted")
-        row("Blocked file types", lambda f: ttk.Entry(f, width=44, textvariable=self.setting_vars["blocked"]),
+        row("Blocked file types", lambda f: ttk.Entry(f, width=34, textvariable=self.setting_vars["blocked"]),
             "comma separated")
         bar = tk.Frame(frame, bg=self.p["bg"])
         bar.pack(fill="x", pady=(14, 0))
