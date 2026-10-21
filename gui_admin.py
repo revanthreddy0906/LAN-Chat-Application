@@ -33,6 +33,7 @@ class AdminConsole:
         self.window.geometry(f"860x560+{app.root.winfo_rootx() + 40}+{app.root.winfo_rooty() + 40}")
         self.window.minsize(720, 480)
         self.window.configure(bg=self.p["bg"])
+        self.window.transient(app.root)  # stay in front of the chat window instead of slipping behind it
         self.window.protocol("WM_DELETE_WINDOW", self.close)
         self._request = 0
         self.user_page = 0

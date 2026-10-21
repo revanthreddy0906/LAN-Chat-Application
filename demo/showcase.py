@@ -42,6 +42,7 @@ e2ee.SCRYPT_N = 2**14  # quick enough to feel real
 PASS, PHRASE = "river-stone-42", "correct horse battery"
 parser = argparse.ArgumentParser()
 parser.add_argument("--auto", action="store_true")
+parser.add_argument("--jump", type=int, default=0, help="run steps 1..N straight away and stop at step N")
 args = parser.parse_args()
 
 # ---------------------------------------------------------------- server and people
@@ -372,7 +373,12 @@ def quit_all():
 
 tk.Button(panel, text="Next screen ▶", command=advance, width=18).pack(pady=(14, 4))
 tk.Button(panel, text="Quit", command=quit_all).pack()
-root.after(300, advance)
+def jump():
+    for _ in range(args.jump):
+        advance()
+
+
+root.after(300, jump if args.jump else advance)
 if args.auto:
     def auto():
         if state["index"] < len(STEPS):
