@@ -26,3 +26,6 @@ __pycache__/
 .claude/
 paper/.claude/
 .DS_Store
+
+# Screenshot showcase data
+demo/showcase/
