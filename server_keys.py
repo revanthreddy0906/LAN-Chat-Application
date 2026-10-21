@@ -29,7 +29,10 @@ class KeysMixin:
 
     def e2ee_state(self, client) -> dict:
         """What the welcome tells a window about encryption on this server."""
-        return {"policy": self.e2ee_policy, "have_keys": self.store.get_user_keys(client.user_id) is not None}
+        epoch = self.store.room_epoch()
+        return {"policy": self.e2ee_policy, "have_keys": self.store.get_user_keys(client.user_id) is not None,
+                "room": self.e2ee_room, "epoch": epoch,
+                "next": self.store.last_group_number(client.user_id, epoch) + 1}
 
     def _keys_reply(self, client, req, ok: bool, **fields) -> None:
         self._emit({"t": "keys_result", "req": req, "ok": ok, **fields}, [client])
@@ -56,6 +59,8 @@ class KeysMixin:
             self.store.set_backup(client.user_id, json.dumps(backup))
         if status != "same":
             self.audit(client.username, f"keys_{status}", detail=f"fingerprint {bundle.fingerprint()[:16]}")
+        if status == "changed":
+            self.store.delete_envelopes_to(client.user_id)  # they were sealed to the old key and can never be opened
         if status in ("changed", "created"):  # created: people who found no keys for them should look again
             with self._lock:
                 others = [c for c in self._clients.values() if c is not client]
@@ -80,6 +85,7 @@ class KeysMixin:
     def _on_keys_reset(self, client, event: dict) -> None:
         had = self.store.delete_user_keys(client.user_id)
         if had:
+            self.store.delete_envelopes_to(client.user_id)
             self.audit(client.username, "keys_reset")
             with self._lock:
                 others = [c for c in self._clients.values() if c is not client]

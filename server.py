@@ -44,6 +44,7 @@ from permissions import can
 from security import DEFAULT_MIN_PASSWORD, LoginGuard, RateLimiter, SlidingWindow, check_password
 from server_admin import AdminMixin
 from server_keys import KeysMixin
+from server_room import RoomMixin
 from protocol import MAX_MESSAGE_BYTES, receive_message, send_message
 from settings import default_home
 from storage import (
@@ -77,7 +78,8 @@ DEFAULT_RATE_LIMIT = (30.0, 10.0)  # (burst, per second) of actions per person
 DEFAULT_CONNECTION_LIMIT = (240, 60.0)  # new connections per address per minute (every picture preview is one)
 LIMITED_EVENTS = {"send": 1.0, "edit": 1.0, "delete": 1.0, "react": 1.0, "pin": 1.0, "upload": 2.0,
                   "download": 1.0, "search": 2.0, "history": 2.0, "passwd": 5.0, "export": 5.0,
-                  "keys_publish": 5.0, "keys_get": 1.0, "keys_backup_get": 3.0, "keys_reset": 5.0}
+                  "keys_publish": 5.0, "keys_get": 1.0, "keys_backup_get": 3.0, "keys_reset": 5.0,
+                  "group_state": 1.0, "group_keys": 2.0, "group_keys_get": 1.0}
 HELP_TEXT = (
     "Commands:\n"
     "  /users            list who is online\n"
@@ -128,7 +130,7 @@ def build_tls_context(certfile: str, keyfile: str) -> ssl.SSLContext:
     return context
 
 
-class ChatServer(AdminMixin, KeysMixin):
+class ChatServer(AdminMixin, KeysMixin, RoomMixin):
     def __init__(
         self,
         host: str = DEFAULT_HOST,
@@ -795,13 +797,17 @@ class ChatServer(AdminMixin, KeysMixin):
 
     def _post_message(self, sender: Client, body: str, to_name: str | None = None,
                       reply_to: int | None = None, attachment: dict | None = None,
-                      enc: str | None = None) -> int | None:
+                      enc: str | None = None, room_mentions: tuple[list[int], bool] | None = None) -> int | None:
         """Store and deliver a message. Returns its id, or None if it was refused.
 
         `enc` is an end-to-end encrypted envelope (JSON text). The server stores and relays it
         without being able to read it, so it skips everything that needs the words themselves."""
         body = body.strip()
         if not body and attachment is None and enc is None:
+            return None
+        if to_name is None and enc is None and self.e2ee_room == "on":
+            self._error(sender, "this room is end-to-end encrypted: use the chat window with your keys unlocked "
+                                "(terminal clients cannot write here).")
             return None
         if to_name is not None and enc is None and self.e2ee_policy == "required":
             self._error(sender, "this server requires end-to-end encryption for private messages: "
@@ -820,7 +826,9 @@ class ChatServer(AdminMixin, KeysMixin):
 
         mention_ids: list[int] = []
         everyone = False
-        if recipient is None and enc is None:
+        if recipient is None and enc is not None and room_mentions is not None:
+            mention_ids, everyone = room_mentions
+        elif recipient is None and enc is None:
             mention_ids, everyone, problem = self._parse_mentions(sender, body)
             if problem:
                 self._error(sender, problem)
@@ -904,6 +912,9 @@ class ChatServer(AdminMixin, KeysMixin):
             if event.get("body") not in (None, ""):
                 self._error(client, "an encrypted message must not also carry readable text.")
                 return
+            if to_name is None:
+                self._room_send(client, event)
+                return
             text = self._checked_envelope(client, enc, to_name)
             if text is not None:
                 self._post_message(client, "", to_name=to_name, reply_to=reply_to, enc=text)
@@ -949,7 +960,10 @@ class ChatServer(AdminMixin, KeysMixin):
         if message.enc is None or event.get("enc") is None or event.get("body") not in (None, ""):
             self._error(client, "an encrypted message can only be edited with a new encrypted version.")
             return
-        text = self._checked_envelope(client, event["enc"], message.recipient)
+        if message.recipient_id is None:  # a message in the encrypted room: a new envelope with a new number
+            text = self._validated_group(client, event["enc"])
+        else:
+            text = self._checked_envelope(client, event["enc"], message.recipient)
         if text is None:
             return
         if self.store.edit_message(message.id, client.user_id, "", enc=text):
@@ -1140,9 +1154,14 @@ class ChatServer(AdminMixin, KeysMixin):
             return deny("malformed upload.")
         envelope = None
         if enc is not None:
-            envelope = self._checked_envelope(client, enc, to_name)
+            if to_name is None:  # a file for the encrypted room
+                envelope = self._validated_group(client, enc)
+            else:
+                envelope = self._checked_envelope(client, enc, to_name)
             if envelope is None:
                 return deny("that encrypted file message is not acceptable.")
+        elif to_name is None and self.e2ee_room == "on":
+            return deny("this room is end-to-end encrypted: use the chat window with your keys unlocked.")
         elif to_name is not None and self.e2ee_policy == "required":
             return deny("this server requires end-to-end encryption for private files: use the chat window "
                         "and unlock your keys.")
@@ -1265,7 +1284,7 @@ class ChatServer(AdminMixin, KeysMixin):
         "react": _on_react, "typing": _on_typing, "presence": _on_presence,
         "read": _on_read, "members": _on_members, "pin": _on_pin, "search": _on_search,
         "history": _on_history, "upload": _on_upload, "download": _on_download,
-        **AdminMixin.HANDLERS, **KeysMixin.HANDLERS,
+        **AdminMixin.HANDLERS, **KeysMixin.HANDLERS, **RoomMixin.HANDLERS,
     }
 
     # ----- leaving

@@ -25,7 +25,7 @@ A curious or hostile person **on the same network** (sniffing, impersonating the
 
 ## Honest limits
 
-- **End-to-end encryption covers private messages and private files (so far).** The group room is protected by TLS but readable by the server and anyone with the host's files. For encrypted files the server also cannot apply file-type rules (the name is hidden), so the receiving window warns before opening a program-like file. Private messages between two people who both have keys are ciphertext in the database; the server still sees who talks to whom, when, and how much.
+- **End-to-end encryption covers private messages, private files and, when an admin switches it on, the group room (text, pictures and files).** With it off, the room is protected by TLS but readable by the server and anyone with the host's files. The room's ratchet is one-way per sender and per epoch but a member's chain is stored sealed on the server for later reading, so there is no forward secrecy against theft of a member's long-term key. For encrypted files the server also cannot apply file-type rules (the name is hidden), so the receiving window warns before opening a program-like file. Private messages between two people who both have keys are ciphertext in the database; the server still sees who talks to whom, when, and how much.
 - **Files are stored unencrypted** in `accounts_files/`.
 - **First-connection trust** depends on someone comparing the fingerprint. Without that, a person already in the middle on the first connect could be trusted.
 - **The audit log detects tampering, it cannot prevent it.** Someone who can rewrite the whole database and the head marker consistently can forge a log; keep an offsite copy of `audit_head` if that matters.

@@ -29,6 +29,7 @@ SETTINGS = {
     "max_upload_mb": ("max_upload", lambda v: str(int(v) * 1024 * 1024)),
     "user_quota_mb": ("user_quota", lambda v: str(int(v) * 1024 * 1024)),
     "password_min": ("password_min", lambda v: str(int(v))),
+    "e2ee_room": ("e2ee_room", lambda v: v if v in ("off", "on") else (_ for _ in ()).throw(ValueError(v))),
     "e2ee_policy": ("e2ee_policy", lambda v: v if v in ("off", "optional", "required") else (_ for _ in ()).throw(ValueError(v))),
     "blocked_extensions": ("blocked_extensions", lambda v: ",".join(
         sorted({p if p.startswith(".") else "." + p for p in (x.strip().lower() for x in v.split(",")) if p}))),
@@ -101,6 +102,7 @@ def run(args: argparse.Namespace, out=print) -> int:
         store.set_disabled(args.name, command == "disable")
         if command == "disable":
             store.delete_user_sessions(user.id)
+            store.bump_room_epoch()  # the encrypted room moves to new keys the removed person never receives
         store.append_audit(actor, f"user_{command}d", user.username)
         out(f"{user.username} is {'disabled' if command == 'disable' else 'enabled'}.")
         return 0

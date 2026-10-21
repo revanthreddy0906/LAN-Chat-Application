@@ -462,5 +462,84 @@ def decrypt_message(envelope: dict, me: Identity, my_name: str, sender_name: str
         raise CryptoError("the message was altered") from error
 
 
+# ----- the group room: one-way key chains per sender -----
+
+MAX_CHAIN_STEPS = 20000  # how far a chain is walked forward to reach a message number
+
+
+class NoKey(CryptoError):
+    """The sender's key for this message has not been given to me (for example it was sent before I joined)."""
+
+
+def chain_message_key(chain_key: bytes) -> bytes:
+    return hmac.new(chain_key, b"lanchat-msgkey-v1", hashlib.sha256).digest()
+
+
+def chain_next(chain_key: bytes) -> bytes:
+    """The next link. It is one-way: holding link n does not reveal any earlier link."""
+    return hmac.new(chain_key, b"lanchat-chain-v1", hashlib.sha256).digest()
+
+
+def chain_advance(chain_key: bytes, steps: int) -> bytes:
+    if steps < 0 or steps > MAX_CHAIN_STEPS:
+        raise CryptoError("that message number is out of range")
+    for _ in range(steps):
+        chain_key = chain_next(chain_key)
+    return chain_key
+
+
+def group_aad(sender: str, epoch: int, number: int) -> bytes:
+    return f"lanchat-group-v1|{sender.lower()}|{epoch}|{number}".encode()
+
+
+def group_key_aad(sender: str, recipient: str, epoch: int) -> bytes:
+    return f"lanchat-groupkey-v1|{sender.lower()}|{recipient.lower()}|{epoch}".encode()
+
+
+def encrypt_group(plaintext: bytes, me: Identity, my_name: str, epoch: int, number: int, chain_key: bytes) -> dict:
+    """One message to the whole room: encrypted under the sender's chain key for this number, and signed."""
+    require()
+    aad = group_aad(my_name, epoch, number)
+    nonce = os.urandom(12)
+    ciphertext = ChaCha20Poly1305(chain_message_key(chain_key)).encrypt(nonce, plaintext, aad)
+    signature = me.sign.sign(b"lanchat-group-env-v1" + nonce + ciphertext + aad)
+    return {"v": 3, "e": epoch, "n": number, "nn": b64(nonce), "ct": b64(ciphertext), "sig": b64(signature)}
+
+
+def group_envelope_fields(envelope) -> tuple[int, int]:
+    """(epoch, message number) of a group envelope, or raises if it is malformed."""
+    try:
+        if envelope.get("v") != 3:
+            raise CryptoError("not a group message")
+        epoch, number = envelope["e"], envelope["n"]
+        for value in (epoch, number):
+            if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+                raise CryptoError("malformed group message")
+        for field in ("nn", "ct", "sig"):
+            if not isinstance(envelope[field], str):
+                raise CryptoError("malformed group message")
+        return epoch, number
+    except (KeyError, TypeError, AttributeError) as error:
+        raise CryptoError("malformed group message") from error
+
+
+def decrypt_group(envelope: dict, sender_name: str, sender: Bundle, chain_key: bytes) -> bytes:
+    """Open a room message given the chain key for its number. Checks the sender's signature first."""
+    require()
+    epoch, number = group_envelope_fields(envelope)
+    aad = group_aad(sender_name, epoch, number)
+    nonce, ciphertext, signature = unb64(envelope["nn"]), unb64(envelope["ct"]), unb64(envelope["sig"])
+    try:
+        Ed25519PublicKey.from_public_bytes(sender.sign).verify(signature, b"lanchat-group-env-v1" + nonce + ciphertext + aad)
+    except InvalidSignature as error:
+        raise CryptoError("the message is not signed by the person it claims to be from") from error
+    except ValueError as error:
+        raise CryptoError("the sender's key is not valid") from error
+    try:
+        return ChaCha20Poly1305(chain_message_key(chain_key)).decrypt(nonce, ciphertext, aad)
+    except InvalidTag as error:
+        raise CryptoError("the message was altered") from error
+
+
 def constant_time_equal(a: str, b: str) -> bool:
     return hmac.compare_digest(a.encode(), b.encode())

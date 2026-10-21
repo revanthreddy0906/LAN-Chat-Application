@@ -141,6 +141,15 @@ CREATE TABLE key_envelopes (
 CREATE INDEX idx_key_envelopes_recipient ON key_envelopes(recipient_id, channel_id);
 """
 
+SCHEMA_V7 = """
+CREATE TABLE group_counters (
+    sender_id  INTEGER NOT NULL REFERENCES users(id),
+    epoch      INTEGER NOT NULL,
+    last_n     INTEGER NOT NULL,
+    PRIMARY KEY (sender_id, epoch)
+);
+"""
+
 # Index + 1 is the schema version. Add new migrations to the end, never edit old ones.
 SCHEMA_V3 = """
 ALTER TABLE messages ADD COLUMN mention_all INTEGER NOT NULL DEFAULT 0;
@@ -173,7 +182,7 @@ END;
 INSERT INTO messages_fts(messages_fts) VALUES ('rebuild');
 """
 
-MIGRATIONS = [SCHEMA_V1, SCHEMA_V2, SCHEMA_V3, SCHEMA_V4, SCHEMA_V5, SCHEMA_V6]
+MIGRATIONS = [SCHEMA_V1, SCHEMA_V2, SCHEMA_V3, SCHEMA_V4, SCHEMA_V5, SCHEMA_V6, SCHEMA_V7]
 MAX_DISTINCT_REACTIONS = 20
 MAX_PINS = 20
 MAX_PAGE = 50
@@ -869,3 +878,86 @@ class Store:
                 " ON CONFLICT(user_id) DO UPDATE SET blob = excluded.blob, updated_at = excluded.updated_at",
                 (user_id, blob, time.time()))
             self._db.commit()
+
+    # ----- the encrypted room: epochs, message numbers and sealed key envelopes -----
+
+    def room_epoch(self, channel_id: int = 1) -> int:
+        with self._lock:
+            row = self._db.execute("SELECT epoch FROM group_epochs WHERE channel_id = ?", (channel_id,)).fetchone()
+            if row:
+                return row["epoch"]
+            self._db.execute("INSERT INTO group_epochs (channel_id, epoch, updated_at) VALUES (?, 1, ?)",
+                             (channel_id, time.time()))
+            self._db.commit()
+            return 1
+
+    def bump_room_epoch(self, channel_id: int = 1) -> int:
+        """Start a new key epoch for the room (someone was removed or an admin asked)."""
+        with self._lock:
+            epoch = self.room_epoch(channel_id) + 1
+            self._db.execute("UPDATE group_epochs SET epoch = ?, updated_at = ? WHERE channel_id = ?",
+                             (epoch, time.time(), channel_id))
+            self._db.commit()
+            return epoch
+
+    def last_group_number(self, sender_id: int, epoch: int) -> int:
+        """The highest message number this person has used in this epoch, or -1."""
+        with self._lock:
+            row = self._db.execute("SELECT last_n FROM group_counters WHERE sender_id = ? AND epoch = ?",
+                                   (sender_id, epoch)).fetchone()
+        return row["last_n"] if row else -1
+
+    def claim_group_number(self, sender_id: int, epoch: int, number: int, max_jump: int = 1000) -> str:
+        """Use a message number if it is new and not absurdly far ahead. Returns 'ok', 'stale' or 'jump'."""
+        with self._lock:
+            last = self.last_group_number(sender_id, epoch)
+            if number <= last:
+                return "stale"
+            if number > last + 1 + max_jump:
+                return "jump"
+            self._db.execute(
+                "INSERT INTO group_counters (sender_id, epoch, last_n) VALUES (?,?,?)"
+                " ON CONFLICT(sender_id, epoch) DO UPDATE SET last_n = excluded.last_n", (sender_id, epoch, number))
+            self._db.commit()
+            return "ok"
+
+    def add_envelope(self, recipient_id: int, sender_id: int, epoch: int, blob: str, channel_id: int = 1) -> int:
+        with self._lock:
+            cursor = self._db.execute(
+                "INSERT INTO key_envelopes (recipient_id, sender_id, channel_id, epoch, blob, created_at)"
+                " VALUES (?,?,?,?,?,?)", (recipient_id, sender_id, channel_id, epoch, blob, time.time()))
+            self._db.commit()
+            return cursor.lastrowid
+
+    def envelopes_for(self, recipient_id: int, after_id: int = 0, limit: int = 5, channel_id: int = 1) -> list[dict]:
+        with self._lock:
+            rows = self._db.execute(
+                "SELECT e.id, u.username AS sender, e.epoch, e.blob FROM key_envelopes e"
+                " JOIN users u ON u.id = e.sender_id WHERE e.recipient_id = ? AND e.channel_id = ? AND e.id > ?"
+                " ORDER BY e.id LIMIT ?", (recipient_id, channel_id, after_id, limit)).fetchall()
+        return [dict(row) for row in rows]
+
+    def missing_recipients(self, sender_id: int, epoch: int, limit: int = 40, channel_id: int = 1) -> list[str]:
+        """Active people with keys who have no envelope from this sender for this epoch yet."""
+        with self._lock:
+            rows = self._db.execute(
+                "SELECT u.username FROM users u JOIN user_keys k ON k.user_id = u.id WHERE u.disabled = 0"
+                " AND NOT EXISTS (SELECT 1 FROM key_envelopes e WHERE e.sender_id = ? AND e.recipient_id = u.id"
+                " AND e.channel_id = ? AND e.epoch = ?) ORDER BY u.id LIMIT ?",
+                (sender_id, channel_id, epoch, limit)).fetchall()
+        return [row["username"] for row in rows]
+
+    def delete_envelopes_to(self, recipient_id: int) -> int:
+        """Envelopes sealed to a key that has been replaced can never be opened again."""
+        with self._lock:
+            cursor = self._db.execute("DELETE FROM key_envelopes WHERE recipient_id = ?", (recipient_id,))
+            self._db.commit()
+            return cursor.rowcount
+
+    def active_users_without_keys(self) -> list[str]:
+        with self._lock:
+            rows = self._db.execute(
+                "SELECT u.username FROM users u WHERE u.disabled = 0 AND NOT EXISTS"
+                " (SELECT 1 FROM user_keys k WHERE k.user_id = u.id) ORDER BY u.id").fetchall()
+        return [row["username"] for row in rows]
+

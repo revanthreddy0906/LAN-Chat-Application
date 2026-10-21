@@ -177,7 +177,12 @@ class AdminMixin:
         for other in self._online(target.username):
             self._remove_client(other.connection)
         self.audit(client.username, "user_disabled", target.username)
+        self.bump_room_epoch(client.username, f"{target.username} was removed")  # they never get the new keys
         self._result(client, req, True, f"{target.username} is disabled and signed out.")
+
+    def _admin_rotate_room(self, client, req, user, value) -> None:
+        epoch = self.bump_room_epoch(client.username, "requested by an admin")
+        self._result(client, req, True, f"The room moved to key epoch {epoch}; everyone starts a fresh chain.")
 
     def _admin_enable(self, client, req, user, value) -> None:
         target = self._target(user)
@@ -236,6 +241,9 @@ class AdminMixin:
             "blocked": sorted(self.blocked_extensions),
             "password_min": self.password_min,
             "e2ee_policy": self.e2ee_policy,
+            "e2ee_room": self.e2ee_room,
+            "room_epoch": self.room_epoch,
+            "without_keys": self.store.active_users_without_keys(),
         }
 
     def _on_admin_settings(self, client, event: dict) -> None:
@@ -255,6 +263,9 @@ class AdminMixin:
             if not all(EXTENSION_PATTERN.fullmatch(p) for p in parts):
                 raise ValueError("file types look like .exe, .bat (letters and digits only).")
             key, stored = "blocked_extensions", ",".join(sorted(set(parts)))
+        elif key == "e2ee_room":
+            self.set_e2ee_room(value, client.username)
+            stored = value
         elif key == "e2ee_policy":
             self._admin_e2ee_policy(client, req, value, None)
             stored = value

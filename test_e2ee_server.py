@@ -32,7 +32,9 @@ class KeysTestCase(V2TestCase):
 class DirectoryTest(KeysTestCase):
     def test_welcome_reports_the_policy_and_whether_i_have_keys(self):
         alice = self.v2("Alice")
-        self.assertEqual(alice.welcome["e2ee"], {"policy": "optional", "have_keys": False})
+        self.assertEqual((alice.welcome["e2ee"]["policy"], alice.welcome["e2ee"]["have_keys"]), ("optional", False))
+        self.assertEqual((alice.welcome["e2ee"]["room"], alice.welcome["e2ee"]["epoch"], alice.welcome["e2ee"]["next"]),
+                         ("off", 1, 0))
         self.publish(alice, Identity.generate())
         alice.close()
         time.sleep(0.3)
@@ -184,7 +186,7 @@ class MigrationTest(unittest.TestCase):
         db.commit()
         db.close()
         store = Store(path)
-        self.assertEqual(store.schema_version(), 6)
+        self.assertEqual(store.schema_version(), 7)
         self.assertEqual([u.username for u in store.list_users()], ["Old"])
         self.assertEqual(store.history_for(1, 10)[0].body, "kept message")
         self.assertEqual(store.set_user_keys(1, "a", "b", "c", "fp"), "created")

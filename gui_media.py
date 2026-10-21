@@ -296,9 +296,7 @@ class MediaManager:
                        f"{human_size(limits.get('max_upload', 0))}.")
         elif is_blocked(name, frozenset(limits.get("blocked", []))):
             app.notice(f"{name}: that type of file is not allowed in this chat.")
-        elif to is None:
-            self._plain_upload(path, name, size, to, reply_to, caption)
-        else:  # a private file: encrypt it if both sides can
+        else:  # a private file or one for an encrypted room is encrypted when it can be
             def decided(plan) -> None:
                 if plan == "plain":
                     self._plain_upload(path, name, size, to, reply_to, caption)
@@ -396,19 +394,22 @@ class MediaManager:
             info["tmp"] = payload["tmp"]
             description = {"name": sanitize_name(info["name"]), "mime": mime_for(info["name"]),
                            "kind": kind_for(info["name"]), "size": info["size"], "key": payload["key"]}
-            envelope = self.app.e2ee.file_envelope(info["to"], info["bundle"], info["caption"], description)
-            if envelope is None:
-                self.requests.pop(payload["request"], None)
-                self._forget_temporary(info)
-                self.app.messages.remove(info["pending"])
-                self.app.notice(f"{info['name']} was not sent: the caption is too long.")
-                return
-            info["pending"].text = f"\U0001F512 Sending {info['name']}…"
-            self._refresh(info["pending"])
-            self.app._send_event({
-                "t": "upload", "req": payload["request"], "name": "", "size": payload["cipher_size"],
-                "sha256": payload["sha256"], "to": info["to"], "reply_to": info["reply_to"], "enc": envelope,
-            })
+            def sealed(envelope) -> None:
+                if payload["request"] not in self.requests:
+                    return
+                if envelope is None:
+                    self.requests.pop(payload["request"], None)
+                    self._forget_temporary(info)
+                    self.app.messages.remove(info["pending"])
+                    self.app.notice(f"{info['name']} was not sent: the caption is too long, or the keys were not ready.")
+                    return
+                info["pending"].text = f"\U0001F512 Sending {info['name']}…"
+                self._refresh(info["pending"])
+                self.app._send_event({
+                    "t": "upload", "req": payload["request"], "name": "", "size": payload["cipher_size"],
+                    "sha256": payload["sha256"], "to": info["to"], "reply_to": info["reply_to"], "enc": envelope,
+                })
+            self.app.e2ee.file_envelope(info["to"], info["bundle"], info["caption"], description, sealed)
         elif op == "uploaded" and info:
             self.requests.pop(payload["request"], None)
             self._forget_temporary(info)

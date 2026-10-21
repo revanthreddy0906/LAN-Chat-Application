@@ -592,7 +592,7 @@ class MessageList(tk.Frame):
         if record.mentioned:
             tk.Label(bubble, text="@ mentioned you", bg=bubble_bg, fg=p["leave"],
                      font=f.tiny).pack(anchor="w")
-        if private:
+        if private or record.secure:
             tag = self._private_tag(record)
             tk.Label(bubble, text=tag, bg=bubble_bg, fg=time_fg, font=f.tiny).pack(anchor="w")
         if record.reply:
@@ -682,7 +682,12 @@ class MessageList(tk.Frame):
 
     @staticmethod
     def _private_tag(record: Record) -> str:
-        to = f" to {record.name}" if record.mine else ""
+        to = f" to {record.name}" if record.mine and record.kind == "private" else ""
+        if record.kind == "chat":  # the group room
+            return {"e2ee": "\U0001F512 Room · end-to-end encrypted",
+                    "pending": "\U0001F512 Room · opening…",
+                    "locked": "\U0001F512 Room · encrypted, keys locked",
+                    "failed": "⚠ Room · could not be opened"}.get(record.secure, "")
         return {
             "e2ee": f"\U0001F512 End-to-end encrypted{to}",
             "pending": f"\U0001F512 Encrypted{to} · opening…",

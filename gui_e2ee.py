@@ -14,7 +14,8 @@ import tkinter as tk
 from typing import Callable
 
 import e2ee
-from e2ee import Bundle, CryptoError, Identity
+from e2ee import Bundle, CryptoError, Identity, NoKey
+from e2ee_group import RoomKeys
 from events import snippet, snippet_around
 from keystore import KeyStore, server_id
 from storage import sanitize_name
@@ -48,6 +49,12 @@ class E2EEManager:
         self.seen_mids: dict[str, int] = {}  # message ids already opened this session, to spot replays
         self.plain_ok: set[str] = set()  # people I agreed to message without encryption
         self._decrypt_job = None
+        self.room_mode = "off"  # is the group room end-to-end encrypted?
+        self.room_epoch = 1
+        self.room_next = 0  # the next message number the server will accept from me
+        self.room: RoomKeys | None = None
+        self.room_loaded = False  # have the key envelopes stored for me been fetched yet?
+        self._room_job = None
 
     # ----- plumbing
 
@@ -66,9 +73,20 @@ class E2EEManager:
         if kind == "key_changed":
             self._on_key_changed(event)
             return
+        if kind == "group_key":
+            self._on_group_key(event)
+            return
+        if kind == "room_epoch":
+            self._on_room_epoch(event)
+            return
+        if kind == "e2ee_room":
+            self._on_room_mode(event)
+            return
         callback = self._pending.pop(event.get("req"), None)
         if callback:
             callback(event)
+        elif kind == "room_state":
+            self._apply_room_state(event)
 
     def remember_password(self, password: str) -> None:
         """Kept only until the welcome arrives, to unlock silently if it is also the passphrase."""
@@ -86,6 +104,8 @@ class E2EEManager:
         self.seen_mids.clear()
         self.plain_ok.clear()
         self._decrypt_job = None
+        self.room, self.room_loaded, self._room_job = None, False, None
+        self.room_mode, self.room_epoch, self.room_next = "off", 1, 0
         for window in list(self.windows.values()):
             try:
                 window.destroy()
@@ -94,6 +114,12 @@ class E2EEManager:
         self.windows.clear()
 
     def label(self) -> str:
+        text = self._key_label()
+        if self.room_mode == "on" and text:
+            text += " · room encrypted" if self.state == "ready" else " · room is encrypted"
+        return text
+
+    def _key_label(self) -> str:
         return {
             "ready": "\U0001F511 keys ready",
             "locked": "\U0001F513 keys locked",
@@ -109,6 +135,8 @@ class E2EEManager:
         info = event.get("e2ee") or {}
         self.policy = info.get("policy", "optional")
         self.server_has_keys = bool(info.get("have_keys"))
+        self.room_mode = info.get("room", "off")
+        self.room_epoch, self.room_next = info.get("epoch", 1), info.get("next", 0)
         app = self.app
         if not e2ee.AVAILABLE:
             self.state = "unavailable"
@@ -119,6 +147,7 @@ class E2EEManager:
             self._sync_with_server()
             app._update_header()
             self.schedule_decrypt()
+            self.start_room()
             return
         self._user = app.username.lower()
         self.store = KeyStore(app.settings.home, server_id(app.fingerprint, app.server_host, app.server_port),
@@ -149,6 +178,7 @@ class E2EEManager:
         self._publish(identity, backup)
         self.app._update_header()
         self.schedule_decrypt()
+        self.start_room()
         return code
 
     def _publish(self, identity: Identity, backup: dict | None = None, callback=None) -> None:
@@ -167,6 +197,7 @@ class E2EEManager:
         self._sync_with_server()
         self.app._update_header()
         self.schedule_decrypt()
+        self.start_room()
         return True
 
     def _sync_with_server(self) -> None:
@@ -203,6 +234,7 @@ class E2EEManager:
             self._sync_with_server()
             self.app._update_header()
             self.schedule_decrypt()
+            self.start_room()
             done(True, "")
         self._request({"t": "keys_backup_get"}, got)
 
@@ -265,6 +297,7 @@ class E2EEManager:
     def _on_key_changed(self, event: dict) -> None:
         name = event.get("user", "")
         self.bundles.pop(name.lower(), None)  # look it up again next time
+        self.room_sync_soon()
         if self.app.private_to and self.app.private_to.lower() == name.lower():
             self.ensure_contacts([name], self.app._update_private_chip)
         if self.store is not None and not event.get("created") and self.store.contact(name):
@@ -379,20 +412,35 @@ class E2EEManager:
 
         self._resolve(to, lambda: done({"t": "send", "to": to, "body": text, **extra}), refuse, secure)
 
-    def plan_file(self, to: str, decided: Callable[[object], None]) -> None:
-        """How should a file for `to` travel? `decided` gets "plain", "refuse" or the recipient's key bundle."""
+    def plan_file(self, to: str | None, decided: Callable[[object], None]) -> None:
+        """How should a file travel? `decided` gets "plain", "refuse", "room" or the recipient's key bundle."""
         def refuse(reason: str) -> None:
             if reason:
                 self.app.notice(reason)
             decided("refuse")
 
+        if to is None:
+            if not self.room_active():
+                decided("plain")
+            elif self.state != "ready":
+                refuse("This room is end-to-end encrypted. Unlock your keys first (⋯ → Encryption keys…).")
+            else:
+                decided("room")
+            return
         self._resolve(to, lambda: decided("plain"), refuse, decided)
 
-    def file_envelope(self, to: str, bundle: Bundle, caption: str, description: dict) -> dict | None:
+    def file_envelope(self, to: str | None, bundle, caption: str, description: dict,
+                      done: Callable[[dict | None], None]) -> None:
         """The encrypted message that accompanies an encrypted file (its name, type, key and caption)."""
-        envelope = e2ee.encrypt_message(e2ee.encode_payload(caption, description), self.identity,
-                                        self.app.username, {to: bundle})
-        return envelope if e2ee.envelope_size(envelope) <= e2ee.MAX_ENVELOPE_CHARS else None
+        def finish(envelope: dict) -> None:
+            done(envelope if e2ee.envelope_size(envelope) <= e2ee.MAX_ENVELOPE_CHARS else None)
+
+        if to is None:
+            self._room_envelope(e2ee.encode_payload(caption, description), lambda envelope: done(
+                envelope if envelope and e2ee.envelope_size(envelope) <= e2ee.MAX_ENVELOPE_CHARS else None))
+            return
+        finish(e2ee.encrypt_message(e2ee.encode_payload(caption, description), self.identity,
+                                    self.app.username, {to: bundle}))
 
     def edit_event(self, record, text: str) -> dict | None:
         """The edit event for one of my encrypted messages (a new envelope), or None if it cannot be made."""
@@ -459,38 +507,69 @@ class E2EEManager:
             return [fresh]
         return []
 
+    def _fail_record(self, record, reason: str, text: str | None = None) -> None:
+        record.secure = "failed"
+        record.text = text or f"⚠ Could not open this message: {reason}."
+        self.app.messages.refresh(record)
+
+    def _open_room_message(self, record):
+        """Decrypt a group message. Returns its payload, "wait" if my keys have not all arrived, or None (failed)."""
+        try:
+            epoch, number = e2ee.group_envelope_fields(record.enc)
+        except CryptoError as error:
+            self._fail_record(record, str(error))
+            return None
+        bundles = self._sender_bundles(record.sender)
+        if not bundles or self.room is None:
+            self._fail_record(record, f"{record.sender} has no encryption keys on the server")
+            return None
+        try:
+            payload = e2ee.decode_payload(self.room.decrypt(record.enc, record.sender, bundles))
+        except NoKey:
+            if not self.room_loaded:
+                return "wait"  # my stored keys are still being fetched; try again when they arrive
+            self._fail_record(record, "", "\U0001F512 Sent before you joined, or before this person shared their key "
+                                          "with you, so it cannot be opened.")
+            return None
+        except CryptoError as error:
+            self._fail_record(record, str(error))
+            return None
+        if not self.room.first_use(record.sender, epoch, number, record.id):
+            self._fail_record(record, "it reuses the number of an earlier message (possible replay)")
+            return None
+        return payload
+
     def _decrypt(self, pending: list) -> None:
         app = self.app
         for record in pending:
             if record.secure not in ("pending", "locked") or not record.enc or self.identity is None:
                 continue
-
-            def fail(reason: str, record=record) -> None:
-                record.secure = "failed"
-                record.text = f"⚠ Could not open this message: {reason}."
-                app.messages.refresh(record)
-
-            candidates = self._sender_bundles(record.sender)
-            if not candidates:
-                fail(f"{record.sender} has no encryption keys on the server")
-                continue
-            payload, last_error = None, ""
-            for bundle in candidates:
-                try:
-                    payload = e2ee.decode_payload(e2ee.decrypt_message(
-                        record.enc, self.identity, app.username, record.sender, bundle))
-                    break
-                except CryptoError as error:
-                    last_error = str(error)
-            if payload is None:
-                fail(last_error)
-                continue
+            if record.enc.get("v") == 3:
+                payload = self._open_room_message(record)
+                if payload is None or payload == "wait":
+                    continue
+            else:
+                candidates = self._sender_bundles(record.sender)
+                if not candidates:
+                    self._fail_record(record, f"{record.sender} has no encryption keys on the server")
+                    continue
+                payload, last_error = None, ""
+                for bundle in candidates:
+                    try:
+                        payload = e2ee.decode_payload(e2ee.decrypt_message(
+                            record.enc, self.identity, app.username, record.sender, bundle))
+                        break
+                    except CryptoError as error:
+                        last_error = str(error)
+                if payload is None:
+                    self._fail_record(record, last_error)
+                    continue
             earlier = self.seen_mids.get(payload["mid"])
             if earlier is not None and earlier != record.id:
-                fail("it is a copy of an earlier message (possible replay)")
+                self._fail_record(record, "it is a copy of an earlier message (possible replay)")
                 continue
             if record.att and record.att.get("kind") == "encrypted" and not payload.get("f"):
-                fail("the description of the file is missing")
+                self._fail_record(record, "the description of the file is missing")
                 continue
             self.seen_mids[payload["mid"]] = record.id
             record.text, record.secure = payload["b"], "e2ee"
@@ -500,6 +579,8 @@ class E2EEManager:
             if record.file:
                 app.media.ensure_preview(record)
         self._fix_replies()
+        if app.pins:
+            app._render_pins()  # pinned encrypted messages can now be quoted
 
     @staticmethod
     def _attach_file(record, info: dict) -> None:
@@ -535,6 +616,217 @@ class E2EEManager:
                                "to": record.name if record.mine else me,
                                "snippet": snippet_around(record.text, terms)})
         return found
+
+    # ----- the encrypted group room
+
+    def room_active(self) -> bool:
+        return self.room_mode == "on" and e2ee.AVAILABLE
+
+    def start_room(self) -> None:
+        """My keys are ready: fetch the chain keys stored for me, then hand mine to whoever is missing them."""
+        if self.identity is None or not e2ee.AVAILABLE:
+            return
+        if self.room is None or self.room.identity is not self.identity:
+            self.room, self.room_loaded = RoomKeys(self.identity, self.app.username), False
+        self.fetch_room_keys(lambda: (self.schedule_decrypt(), self.sync_room() if self.room_active() else None))
+
+    def fetch_room_keys(self, done: Callable[[], None] | None = None) -> None:
+        if self.room is None:
+            if done:
+                done()
+            return
+        cursor = {"after": 0}
+
+        def page() -> None:
+            def got(reply: dict) -> None:
+                items = reply.get("items", [])
+
+                def accept() -> None:
+                    for item in items:
+                        self._accept_key(item["sender"], item["blob"])
+                        cursor["after"] = max(cursor["after"], item["id"])
+                    if reply.get("more"):
+                        page()
+                    else:
+                        self.room_loaded = True
+                        if done:
+                            done()
+                self.ensure_contacts(sorted({i["sender"] for i in items}), accept)
+            self._request({"t": "group_keys_get", "after": cursor["after"]}, got)
+        page()
+
+    def _accept_key(self, sender: str, blob: dict) -> bool:
+        """Store a chain key someone gave me. False if it cannot be opened (for example sealed to an old key)."""
+        if self.room is None:
+            return False
+        try:
+            self.room.accept_envelope(sender, self._sender_bundles(sender), blob)
+            return True
+        except CryptoError:
+            return False
+
+    def _on_group_key(self, event: dict) -> None:
+        if self.room is None or self.state != "ready":
+            return
+        self.ensure_contacts([event.get("sender", "")], lambda: (
+            self._accept_key(event.get("sender", ""), event.get("blob") or {}), self.schedule_decrypt()))
+
+    def _on_room_epoch(self, event: dict) -> None:
+        self.room_epoch, self.room_next = event.get("epoch", self.room_epoch), 0
+        if self.room_active():
+            self.app.notice("The room's encryption keys were renewed (someone was removed or an admin asked).",
+                            tone="system")
+            self.room_sync_soon()
+
+    def _on_room_mode(self, event: dict) -> None:
+        self.room_mode, self.room_epoch = event.get("mode", "off"), event.get("epoch", self.room_epoch)
+        if self.room_mode == "on":
+            self.app.notice("\U0001F512 The group room is now end-to-end encrypted. New messages can only be read by "
+                            "people who have set up their keys.", tone="system")
+            self.start_room()
+        else:
+            self.app.notice("The group room is no longer end-to-end encrypted.", tone="system")
+        self.app._update_header()
+        self.app._update_private_chip()
+
+    def _apply_room_state(self, reply: dict) -> None:
+        self.room_mode = reply.get("mode", self.room_mode)
+        self.room_epoch, self.room_next = reply.get("epoch", self.room_epoch), reply.get("next", self.room_next)
+
+    def room_sync_soon(self) -> None:
+        if self.room_active() and self.state == "ready" and self._room_job is None:
+            self._room_job = self.app.root.after(300, self._run_room_sync)
+
+    def _run_room_sync(self) -> None:
+        self._room_job = None
+        self.sync_room()
+
+    def sync_room(self, done: Callable[[], None] | None = None, rounds: int = 0) -> None:
+        """Learn the room's epoch and my next message number, and give my chain key to anyone who lacks it."""
+        if not self.room_active() or self.state != "ready" or self.room is None:
+            if done:
+                done()
+            return
+
+        def got(reply: dict) -> None:
+            self._apply_room_state(reply)
+            missing = reply.get("missing", [])
+            me = self.app.username.lower()
+            if not missing or rounds >= 5 or self.room_mode != "on":
+                if done:
+                    done()
+                return
+            self.ensure_contacts([n for n in missing if n.lower() != me], lambda: self._give_keys(
+                missing, lambda: self.sync_room(done, rounds + 1), done))
+        self._request({"t": "group_state"}, got)
+
+    def _give_keys(self, missing: list[str], again: Callable[[], None], stop: Callable[[], None] | None) -> None:
+        envelopes = {}
+        me = self.app.username.lower()
+        for name in missing:
+            if name.lower() == me:
+                envelopes[name] = self.room.own_envelope(self.room_epoch)
+                continue
+            bundle = self.bundles.get(name.lower())
+            if bundle is None:
+                continue
+            status = self.contact_status(name, bundle)
+            if status == "changed":  # not until I have accepted their new code
+                self.changed.add(name.lower())
+                continue
+            if status == "new":
+                self.store.pin_contact(name, bundle)
+            envelopes[name] = self.room.key_envelope(name, bundle, self.room_epoch, self.room_next)
+        if not envelopes:
+            if stop:
+                stop()
+            return
+        self._request({"t": "group_keys", "epoch": self.room_epoch, "envelopes": envelopes},
+                      lambda reply: (self._apply_room_state(reply), again()))
+
+    def _room_envelope(self, payload: bytes, done: Callable[[dict | None], None]) -> None:
+        """Encrypt `payload` for the whole room: bring keys up to date, then use my next message number."""
+        def go() -> None:
+            def encrypt() -> None:
+                if not self.room_active() or self.room is None or self.state != "ready":
+                    done(None)
+                    return
+                envelope = self.room.encrypt(payload, self.room_epoch, self.room_next)
+                self.room_next += 1
+                done(envelope)
+            self.sync_room(encrypt)
+
+        if self.room is not None and not self.room_loaded:
+            self.fetch_room_keys(go)
+        else:
+            go()
+
+    _MENTION = re.compile(r"(?<![\w@])@([A-Za-z0-9_.-]{1,32})")
+
+    def _mentions_in(self, text: str) -> tuple[list[str], bool]:
+        known = {m.name.lower(): m.name for m in self.app.members}
+        names, everyone = [], False
+        for token in dict.fromkeys(self._MENTION.findall(text)):
+            token = token.rstrip(".-")
+            if token.lower() == "everyone":
+                everyone = True
+            elif token.lower() in known:
+                names.append(known[token.lower()])
+        return names, everyone
+
+    def send_room(self, text: str, reply_id: int | None, done: Callable[[dict | None], None]) -> None:
+        """A message to the encrypted room: `done(event)` gets what to send, or None if it was refused."""
+        app = self.app
+        size = len(text.encode("utf-8"))
+        if self.state != "ready":
+            app.notice("This room is end-to-end encrypted. Set up or unlock your keys first (⋯ → Encryption keys…); "
+                       "until then you can read nothing new and cannot write.")
+            done(None)
+            return
+        if size > e2ee.MAX_TEXT_BYTES:
+            app.notice(f"Encrypted messages can be up to {e2ee.MAX_TEXT_BYTES} bytes; this one is {size}. Please shorten it.")
+            done(None)
+            return
+        names, everyone = self._mentions_in(text)
+
+        def sealed(envelope: dict | None) -> None:
+            if envelope is None:
+                app.notice("The message could not be encrypted for the room. Please try again.")
+                done(None)
+                return
+            event = {"t": "send", "enc": envelope}
+            if reply_id:
+                event["reply_to"] = reply_id
+            if names:
+                event["mentions"] = names
+            if everyone:
+                event["everyone"] = True
+            done(event)
+        self._room_envelope(e2ee.encode_payload(text), sealed)
+
+    def edit_room(self, record, text: str, done: Callable[[dict | None], None]) -> None:
+        size = len(text.encode("utf-8"))
+        if self.state != "ready":
+            self.app.notice("Unlock your encryption keys to edit this message.")
+            done(None)
+            return
+        if size > e2ee.MAX_TEXT_BYTES:
+            self.app.notice(f"Encrypted messages can be up to {e2ee.MAX_TEXT_BYTES} bytes; this one is {size}.")
+            done(None)
+            return
+
+        def sealed(envelope: dict | None) -> None:
+            if envelope is None or e2ee.envelope_size(envelope) > e2ee.MAX_ENVELOPE_CHARS:
+                self.app.notice("That edit could not be encrypted. Please try again, with a shorter caption if there is one.")
+                done(None)
+                return
+            done({"t": "edit", "id": record.id, "enc": envelope})
+        self._room_envelope(e2ee.encode_payload(text, record.file), sealed)
+
+    def room_label(self) -> str:
+        if self.state == "ready":
+            return "\U0001F512 Group room · end-to-end encrypted"
+        return "\U0001F513 Group room is encrypted · unlock your keys to read and write"
 
     # ----- dialogs
 

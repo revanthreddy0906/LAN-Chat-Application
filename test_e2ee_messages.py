@@ -124,8 +124,8 @@ class ValidationTest(V2TestCase):
         self.assertEqual(self.server.store.history_for(1, 10)[-1:], [])
         return notice["text"]
 
-    def test_only_private_messages_can_be_encrypted_for_now(self):
-        self.assertIn("only private", self.refused(enc=self.alice.envelope("x", [self.bob])))
+    def test_an_encrypted_public_message_is_refused_while_the_room_is_not_encrypted(self):
+        self.assertIn("not end-to-end encrypted", self.refused(enc=self.alice.envelope("x", [self.bob])))
 
     def test_no_readable_text_alongside(self):
         self.assertIn("must not also", self.refused(to="Bob", body="plain too", enc=self.alice.envelope("x", [self.bob])))

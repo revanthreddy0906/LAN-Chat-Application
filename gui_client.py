@@ -27,7 +27,7 @@ from chat_core import (
     DEFAULT_PORT,
 )
 from discovery import FoundServer, discover, lan_address
-from events import clock, decode
+from events import clock, decode, snippet
 from gui_admin import AdminConsole
 from gui_e2ee import E2EEManager
 from gui_media import MediaManager
@@ -759,6 +759,7 @@ class App:
             text=f"{lock}{encryption_label(self.encrypted)} · {online} online · "
                  f"signed in as {self.username}" + (f" ({role})" if role else "")
                  + (f" · {self.e2ee.label()}" if self.e2ee.label() else ""))
+        self._update_private_chip()  # the chip above the box shows the room's lock state too
 
     def set_composer_enabled(self, enabled: bool) -> None:
         self.message_entry.set_enabled(enabled)
@@ -847,6 +848,9 @@ class App:
     def _update_private_chip(self) -> None:
         if self.private_to:
             self.private_label.configure(text=self.e2ee.private_label(self.private_to))
+            self.private_chip.pack(anchor="w", before=self.composer_row)
+        elif self.e2ee.room_active():
+            self.private_label.configure(text=self.e2ee.room_label())
             self.private_chip.pack(anchor="w", before=self.composer_row)
         else:
             self.private_chip.pack_forget()
@@ -1002,9 +1006,18 @@ class App:
 
     def _render_pins(self) -> None:
         if self.pins:
-            self.pin_label.configure(text=pin_bar_text(self.pins))
+            self.pin_label.configure(text=pin_bar_text([self._pin_view(p) for p in self.pins]))
             self.pin_button.set_text(f"{len(self.pins)} pinned")
         self._place_bars()
+
+    def _pin_view(self, pin: dict) -> dict:
+        """A pinned message as shown: encrypted ones have no text on the server, so use what this window decrypted."""
+        if pin.get("snippet"):
+            return pin
+        record = self.messages.record_for(pin["id"])
+        if record is not None and record.secure == "e2ee" and record.text:
+            return {**pin, "snippet": snippet(record.text)}
+        return {**pin, "snippet": "\U0001F512 Encrypted message"}
 
     def _ev_pins(self, event: dict) -> None:
         self.pins = event.get("pins", [])
@@ -1045,7 +1058,7 @@ class App:
             text.pack(side="left", fill="x", expand=True)
             tk.Label(text, text=f"{pin['sender']} · {clock(pin['ts'])}", bg=p["card"], fg=p["muted"],
                      font=self.f.tiny).pack(anchor="w")
-            tk.Label(text, text=pin["snippet"], bg=p["card"], fg=p["text"], font=self.f.small,
+            tk.Label(text, text=self._pin_view(pin)["snippet"], bg=p["card"], fg=p["text"], font=self.f.small,
                      justify="left", wraplength=300, anchor="w").pack(anchor="w")
             bind_click(text, lambda _e, i=pin["id"]: self._jump_from_pins(i))
             if self._can_unpin(pin):
@@ -1179,12 +1192,22 @@ class App:
             self.leave()
             return "break"
         if self.editing is not None:
+            if self.editing.secure == "e2ee" and self.editing.kind == "chat":  # a room message
+                if not self._private_send_busy:
+                    self._private_send_busy = True
+                    self.e2ee.edit_room(self.editing, text, self._private_send_done)
+                return "break"
             if self.editing.secure == "e2ee":
                 event = self.e2ee.edit_event(self.editing, text)
                 if event is None:
                     return "break"
             else:
                 event = {"t": "edit", "id": self.editing.id, "body": text}
+        elif self.e2ee.room_active() and not self.private_to and not text.startswith("/"):
+            if not self._private_send_busy:
+                self._private_send_busy = True
+                self.e2ee.send_room(text, self.reply_to.id if self.reply_to else None, self._private_send_done)
+            return "break"
         elif self.private_to and not text.startswith("/"):
             if not self._private_send_busy:
                 self._private_send_busy = True
@@ -1488,6 +1511,7 @@ class App:
         self.e2ee.handle(event)
 
     _ev_keys_result = _ev_keys = _ev_keys_backup = _ev_key_changed = _e2ee_event
+    _ev_room_state = _ev_group_key = _ev_group_keys_list = _ev_room_epoch = _ev_e2ee_room = _e2ee_event
 
     def _ev_e2ee_policy(self, event: dict) -> None:
         self.e2ee.policy = event.get("policy", "optional")
@@ -1622,6 +1646,7 @@ class App:
         if event.get("page", 0) >= event.get("pages", 1) - 1:
             self._set_members(self._members_buffer)
             self._members_buffer = []
+            self.e2ee.room_sync_soon()  # someone new may need my room key
 
     def _ev_presence(self, event: dict) -> None:
         status = event.get("status", "online")

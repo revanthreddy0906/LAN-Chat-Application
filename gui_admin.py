@@ -246,6 +246,7 @@ class AdminConsole:
             "open_registration": tk.BooleanVar(value=True),
             "max_upload_mb": tk.StringVar(), "user_quota_mb": tk.StringVar(),
             "password_min": tk.StringVar(), "blocked": tk.StringVar(), "e2ee_policy": tk.StringVar(value="optional"),
+            "e2ee_room": tk.StringVar(value="off"),
         }
 
         def row(label: str, widget_factory, hint: str = "") -> None:
@@ -266,11 +267,18 @@ class AdminConsole:
         row("End-to-end encryption", lambda f: ttk.Combobox(f, values=["off", "optional", "required"], width=10, state="readonly",
                                                          textvariable=self.setting_vars["e2ee_policy"]),
             "required = private messages must be encrypted")
+        row("Encrypt the group room", lambda f: ttk.Combobox(f, values=["off", "on"], width=10, state="readonly",
+                                                          textvariable=self.setting_vars["e2ee_room"]),
+            "on = room messages are end-to-end encrypted")
+        self.room_note = tk.Label(frame, text="", anchor="w", justify="left", wraplength=640, bg=self.p["bg"],
+                                  fg=self.p["muted"], font=self.app.f.small)
+        self.room_note.pack(fill="x", pady=(0, 4))
         row("Blocked file types", lambda f: ttk.Entry(f, width=34, textvariable=self.setting_vars["blocked"]),
             "comma separated")
         bar = tk.Frame(frame, bg=self.p["bg"])
         bar.pack(fill="x", pady=(14, 0))
         self._button(bar, "Save settings", self.save_settings)
+        self._button(bar, "Re-key the room now", self.rotate_room)
         self._button(bar, "Reload", lambda: self.send({"t": "admin_settings"}))
 
     def on_settings(self, event: dict) -> None:
@@ -280,6 +288,18 @@ class AdminConsole:
         self.setting_vars["password_min"].set(str(event["password_min"]))
         self.setting_vars["blocked"].set(", ".join(event["blocked"]))
         self.setting_vars["e2ee_policy"].set(event.get("e2ee_policy", "optional"))
+        self.setting_vars["e2ee_room"].set(event.get("e2ee_room", "off"))
+        without = event.get("without_keys", [])
+        self.room_note.configure(text=(
+            f"Key epoch {event.get('room_epoch', 1)}. " + (
+                f"{len(without)} people have not set up keys and could not read or write in an encrypted room: "
+                + ", ".join(without[:8]) + ("…" if len(without) > 8 else "") + "." if without
+                else "Everyone has set up keys.")))
+
+    def rotate_room(self) -> None:
+        if messagebox.askyesno("Re-key the room?", "Everyone's window starts a fresh key chain for the room. "
+                               "Use it after removing someone or if a computer was lost.", parent=self.window):
+            self.send({"t": "admin", "op": "rotate_room"})
 
     def save_settings(self) -> None:
         for key, var in self.setting_vars.items():
