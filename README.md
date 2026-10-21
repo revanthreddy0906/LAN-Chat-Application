@@ -50,7 +50,8 @@ Requirements: Python 3.10+ with Tkinter (included with most installs). `openssl`
 - The first time you sign in you set a passphrase and are shown a **recovery code** once. Your keys stay on your computer; the server holds only your public key and a backup it cannot open.
 - When you message someone who has also set up keys, the chip above the box reads "🔒 End-to-end encrypted with Bob" and the server stores only ciphertext it cannot read. Right-click a name → **Verify security code** to compare a 60-digit code with them. If someone's code ever changes you are warned and sending stops until you accept the new one.
 - Replies, edits, reactions and local search of what is on screen all work on encrypted messages. Messages are limited to 1500 bytes. If the other person has no keys you are asked before sending anything readable by the server. An admin can set the policy to off, optional or **required** (⋯ → Admin console → Settings).
-- Not yet encrypted: files and pictures, and the group room. See [SECURITY.md](docs/SECURITY.md).
+- **Files, pictures and audio sent privately are encrypted too**, on your computer, in chunks, before they leave it. The server stores unreadable bytes and never learns the name, type or contents; the recipient's window decrypts, previews and opens them. Programs such as `.exe` hidden inside an encrypted file are still recognised by the receiving window, which asks before opening. Captions on encrypted files can be up to 1000 bytes.
+- Not yet encrypted: the group room. See [SECURITY.md](docs/SECURITY.md).
 
 **Your account (the ⋯ button)**
 - **Change password…** signs out every other saved sign-in.

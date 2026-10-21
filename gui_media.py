@@ -13,15 +13,18 @@ import subprocess
 import sys
 import threading
 import tkinter as tk
+import uuid
 from pathlib import Path
 
 import audio
+import e2ee
 import transfer
 from gui_widgets import Record
-from storage import human_size, is_blocked, sha256_of_file
+from storage import human_size, is_blocked, kind_for, mime_for, sanitize_name, sha256_of_file
 
 PREVIEW_LIMIT = 8 * 1024 * 1024  # pictures bigger than this show as a file card
 THUMB_PIXELS = 320
+MAX_FILE_CAPTION = 1000  # bytes; an encrypted file's description shares the message with it
 MAX_PARALLEL = 3
 
 
@@ -64,10 +67,22 @@ class MediaManager:
         self._waiting: list[tuple[Record, str, str | None]] = []  # previews waiting their turn
         self.player = audio.Player()
         self.recorder = audio.VoiceRecorder() if audio.recorder_available() else None
+        self._clear_outgoing()
+
+    def _clear_outgoing(self) -> None:
+        """Encrypted copies made for uploading are temporary; remove any left by a crash."""
+        for leftover in (self.cache_dir / "outgoing").glob("*"):
+            leftover.unlink(missing_ok=True)
+
+    def _forget_temporary(self, info: dict) -> None:
+        if info.get("tmp"):
+            Path(info["tmp"]).unlink(missing_ok=True)
 
     # ----- plumbing
 
     def reset(self) -> None:
+        for info in self.requests.values():
+            self._forget_temporary(info)
         self.requests.clear()
         self._active = 0
         self._waiting.clear()
@@ -160,13 +175,20 @@ class MediaManager:
                 last[0] = percent
                 self._post(op="progress", request=request, percent=percent)
 
+        key = attachment.get("key")  # present for an end-to-end encrypted file
+        target = path.with_name(path.name + ".enc") if key else path
         with self._slots:
             try:
-                transfer.download(host, port, context, ticket, attachment["size"], attachment["sha256"],
-                                  path, progress)
-            except transfer.TransferError as error:
+                transfer.download(host, port, context, ticket, attachment["cipher_size"] if key else attachment["size"],
+                                  attachment["sha256"], target, progress)
+                if key:
+                    e2ee.decrypt_file(str(target), str(path), e2ee.unb64(key), attachment["size"])
+            except (transfer.TransferError, e2ee.CryptoError, OSError) as error:
                 self._post(op="failed", request=request, reason=str(error))
                 return
+            finally:
+                if key:
+                    target.unlink(missing_ok=True)
         self._post(op="downloaded", request=request)
 
     def _release(self) -> None:
@@ -237,6 +259,13 @@ class MediaManager:
     # ----- actions chosen from a message
 
     def open(self, record: Record) -> None:
+        attachment = record.att
+        if (attachment and attachment.get("key")
+                and is_blocked(attachment["name"], frozenset(self.app.limits.get("blocked", [])))):
+            # the server could not check the name of an encrypted file, so the window asks
+            if not self.app.confirm("Open this file?", f"{attachment['name']} is a kind of file that can run programs. "
+                                    "Only open it if you trust the person who sent it."):
+                return
         self.fetch(record, "open")
 
     def play(self, record: Record) -> None:
@@ -267,12 +296,46 @@ class MediaManager:
                        f"{human_size(limits.get('max_upload', 0))}.")
         elif is_blocked(name, frozenset(limits.get("blocked", []))):
             app.notice(f"{name}: that type of file is not allowed in this chat.")
-        else:
-            pending = Record("notice", f"⬆ Preparing {name}…", tone="upload")
-            request = self._new_request(op="upload", path=path, name=name, to=to, reply_to=reply_to,
-                                        caption=caption, size=size, pending=pending)
-            app.messages.add(pending)
-            threading.Thread(target=self._hash_thread, args=(request, path), daemon=True).start()
+        elif to is None:
+            self._plain_upload(path, name, size, to, reply_to, caption)
+        else:  # a private file: encrypt it if both sides can
+            def decided(plan) -> None:
+                if plan == "plain":
+                    self._plain_upload(path, name, size, to, reply_to, caption)
+                elif plan != "refuse":
+                    self._encrypted_upload(path, name, size, to, reply_to, caption, plan)
+            app.e2ee.plan_file(to, decided)
+
+    def _plain_upload(self, path, name, size, to, reply_to, caption) -> None:
+        pending = Record("notice", f"⬆ Preparing {name}…", tone="upload")
+        request = self._new_request(op="upload", path=path, name=name, to=to, reply_to=reply_to,
+                                    caption=caption, size=size, pending=pending)
+        self.app.messages.add(pending)
+        threading.Thread(target=self._hash_thread, args=(request, path), daemon=True).start()
+
+    def _encrypted_upload(self, path, name, size, to, reply_to, caption, bundle) -> None:
+        if len(caption.encode("utf-8")) > MAX_FILE_CAPTION:
+            self.app.notice(f"A caption on an encrypted file can be up to {MAX_FILE_CAPTION} bytes.")
+            return
+        pending = Record("notice", f"\U0001F512 Encrypting {name}…", tone="upload")
+        request = self._new_request(op="upload", path=path, name=name, to=to, reply_to=reply_to, caption=caption,
+                                    size=size, pending=pending, bundle=bundle)
+        self.app.messages.add(pending)
+        threading.Thread(target=self._encrypt_thread, args=(request, path), daemon=True).start()
+
+    def _encrypt_thread(self, request: int, path: str) -> None:
+        folder = self.cache_dir / "outgoing"
+        folder.mkdir(parents=True, exist_ok=True)
+        temporary = folder / (uuid.uuid4().hex + ".enc")
+        key = e2ee.new_file_key()
+        try:
+            cipher_size, digest = e2ee.encrypt_file(path, str(temporary), key)
+        except (OSError, e2ee.CryptoError) as error:
+            temporary.unlink(missing_ok=True)
+            self._post(op="upload_failed", request=request, reason=str(error))
+            return
+        self._post(op="encrypted", request=request, tmp=str(temporary), key=e2ee.b64(key),
+                   cipher_size=cipher_size, sha256=digest)
 
     def _hash_thread(self, request: int, path: str) -> None:
         try:
@@ -304,11 +367,12 @@ class MediaManager:
         info = self.requests.get(event.get("req"))
         if info and info["op"] == "upload":
             threading.Thread(target=self._upload_thread, daemon=True,
-                             args=(event["req"], event["ticket"], info["path"])).start()
+                             args=(event["req"], event["ticket"], info.get("tmp") or info["path"])).start()
 
     def on_upload_denied(self, event: dict) -> None:
         info = self.requests.pop(event.get("req"), None)
         if info and info["op"] == "upload":
+            self._forget_temporary(info)
             self.app.messages.remove(info["pending"])
             self.app.notice(f"{info['name']} was not sent: {event.get('reason', 'refused')}")
 
@@ -328,11 +392,30 @@ class MediaManager:
         elif op == "upload_progress" and info:
             info["pending"].text = f"⬆ Sending {info['name']}… {payload['percent']}%"
             self._refresh(info["pending"])
+        elif op == "encrypted" and info:
+            info["tmp"] = payload["tmp"]
+            description = {"name": sanitize_name(info["name"]), "mime": mime_for(info["name"]),
+                           "kind": kind_for(info["name"]), "size": info["size"], "key": payload["key"]}
+            envelope = self.app.e2ee.file_envelope(info["to"], info["bundle"], info["caption"], description)
+            if envelope is None:
+                self.requests.pop(payload["request"], None)
+                self._forget_temporary(info)
+                self.app.messages.remove(info["pending"])
+                self.app.notice(f"{info['name']} was not sent: the caption is too long.")
+                return
+            info["pending"].text = f"\U0001F512 Sending {info['name']}…"
+            self._refresh(info["pending"])
+            self.app._send_event({
+                "t": "upload", "req": payload["request"], "name": "", "size": payload["cipher_size"],
+                "sha256": payload["sha256"], "to": info["to"], "reply_to": info["reply_to"], "enc": envelope,
+            })
         elif op == "uploaded" and info:
             self.requests.pop(payload["request"], None)
+            self._forget_temporary(info)
             self.app.messages.remove(info["pending"])
         elif op == "upload_failed" and info:
             self.requests.pop(payload["request"], None)
+            self._forget_temporary(info)
             self.app.messages.remove(info["pending"])
             self.app.notice(f"{info['name']} was not sent: {payload['reason']}")
         elif op == "exported" and info:

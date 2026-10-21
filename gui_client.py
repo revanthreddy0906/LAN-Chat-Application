@@ -1406,7 +1406,7 @@ class App:
         items: list = []
         if not record.deleted:
             items.append(("Reply", "reply", None))
-            if record.att:
+            if record.att and record.att["kind"] != "encrypted":
                 items.append(("Play" if record.att["kind"] == "audio" else "Open", "att_play" if record.att["kind"] == "audio" else "att_open", None))
                 items.append(("Save as…", "att_save", None))
             if can(role, "react"):
@@ -1579,9 +1579,12 @@ class App:
         existing = self.messages.record_for(record.id)
         if existing is not None:  # already on screen (history replayed after a reconnect)
             if record.enc and existing.secure == "e2ee" and existing.enc == record.enc:
-                record.text, record.secure = existing.text, "e2ee"  # keep what was already decrypted
+                # keep what was already decrypted, including the file it describes
+                record.text, record.secure, record.att, record.file = (
+                    existing.text, "e2ee", existing.att, existing.file)
             self.messages.update(record.id, text=record.text, edited=record.edited, deleted=record.deleted,
-                                 reactions=record.reactions, enc=record.enc, secure=record.secure)
+                                 reactions=record.reactions, enc=record.enc, secure=record.secure,
+                                 att=record.att, file=record.file)
             self.e2ee.schedule_decrypt()
             return
         if event.get("history") and not self.divider_added and not record.mine and record.id > self.last_read:
@@ -1643,7 +1646,8 @@ class App:
         self.messages.update(event["id"], text=event["body"], edited=True)
 
     def _ev_deleted(self, event: dict) -> None:
-        self.messages.update(event["id"], text="", deleted=True, reactions=[], seen_by=[], enc=None, secure="")
+        self.messages.update(event["id"], text="", deleted=True, reactions=[], seen_by=[], enc=None, secure="",
+                             att=None, file=None)
         if self.editing is not None and self.editing.id == event["id"]:
             self._cancel_context()
         if self.reply_to is not None and self.reply_to.id == event["id"]:

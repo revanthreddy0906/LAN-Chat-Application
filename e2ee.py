@@ -287,10 +287,13 @@ def message_aad(kind: str, sender: str, names) -> bytes:
     return f"lanchat-msg-v2|{kind}|{sender.lower()}|{','.join(sorted(n.lower() for n in names))}".encode()
 
 
-def encode_payload(body: str) -> bytes:
-    """The plaintext that gets encrypted: the text, a random id (to spot replays) and the time."""
-    return json.dumps({"b": body, "mid": secrets.token_hex(8), "ts": time.time()}, ensure_ascii=False,
-                      separators=(",", ":")).encode("utf-8")
+def encode_payload(body: str, file: dict | None = None) -> bytes:
+    """The plaintext that gets encrypted: the text, a random id (to spot replays), the time and,
+    for a file message, what the file is and the key that opens it."""
+    payload = {"b": body, "mid": secrets.token_hex(8), "ts": time.time()}
+    if file is not None:
+        payload["f"] = file
+    return json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
 
 
 def decode_payload(data: bytes) -> dict:
@@ -298,9 +301,104 @@ def decode_payload(data: bytes) -> dict:
         payload = json.loads(data.decode("utf-8"))
         if not isinstance(payload, dict) or not isinstance(payload.get("b"), str) or not isinstance(payload.get("mid"), str):
             raise ValueError
+        if "f" in payload and file_info(payload["f"]) is None:
+            raise ValueError
     except (ValueError, UnicodeError) as error:
         raise CryptoError("the decrypted message is malformed") from error
     return payload
+
+
+# ----- files: encrypted in chunks, so a big file never has to fit in memory -----
+
+FILE_CHUNK = 64 * 1024
+FILE_TAG = 16
+FILE_AAD = b"lanchat-file-v1"
+FILE_KINDS = ("image", "video", "audio", "file")
+
+
+def file_info(data) -> dict | None:
+    """The file description inside an encrypted message, if it is well formed (else None)."""
+    try:
+        if (isinstance(data, dict) and isinstance(data["name"], str) and 0 < len(data["name"]) <= 255
+                and isinstance(data["size"], int) and not isinstance(data["size"], bool) and data["size"] > 0
+                and data["kind"] in FILE_KINDS and isinstance(data["mime"], str) and len(data["mime"]) <= 120
+                and len(unb64(data["key"])) == 32):
+            return data
+    except (KeyError, CryptoError):
+        pass
+    return None
+
+
+def new_file_key() -> bytes:
+    return os.urandom(32)
+
+
+def encrypted_size(plain_size: int) -> int:
+    """How many bytes a file of this size occupies once encrypted."""
+    return plain_size + FILE_TAG * max(1, -(-plain_size // FILE_CHUNK))
+
+
+def _chunk_nonce(index: int, final: bool) -> bytes:
+    """Chunk number plus a flag on the last chunk, so reordering, dropping or adding chunks is detected."""
+    return index.to_bytes(8, "big") + (b"\x00\x00\x00\x01" if final else b"\x00\x00\x00\x00")
+
+
+def encrypt_file(source: str, target: str, key: bytes, progress=None) -> tuple[int, str]:
+    """Encrypt `source` into `target`. Returns (encrypted size, its SHA-256), which is what the server sees."""
+    require()
+    plain_size = os.path.getsize(source)
+    if plain_size == 0:
+        raise CryptoError("an empty file cannot be shared")
+    aead, digest, index, done = ChaCha20Poly1305(key), hashlib.sha256(), 0, 0
+    with open(source, "rb") as reader, open(target, "wb") as writer:
+        chunk = reader.read(FILE_CHUNK)
+        while True:
+            following = reader.read(FILE_CHUNK)
+            final = not following
+            sealed = aead.encrypt(_chunk_nonce(index, final), chunk, FILE_AAD)
+            writer.write(sealed)
+            digest.update(sealed)
+            done += len(chunk)
+            index += 1
+            if progress:
+                progress(done, plain_size)
+            if final:
+                break
+            chunk = following
+    return os.path.getsize(target), digest.hexdigest()
+
+
+def decrypt_file(source: str, target: str, key: bytes, plain_size: int, progress=None) -> None:
+    """Decrypt `source` into `target`, writing the file only if every chunk checks out."""
+    require()
+    if os.path.getsize(source) != encrypted_size(plain_size):
+        raise CryptoError("the file has the wrong size (it was cut short or extended)")
+    aead, index, done = ChaCha20Poly1305(key), 0, 0
+    partial = target + ".part"
+    try:
+        with open(source, "rb") as reader, open(partial, "wb") as writer:
+            chunk = reader.read(FILE_CHUNK + FILE_TAG)
+            while True:
+                following = reader.read(FILE_CHUNK + FILE_TAG)
+                final = not following
+                try:
+                    plain = aead.decrypt(_chunk_nonce(index, final), chunk, FILE_AAD)
+                except InvalidTag as error:
+                    raise CryptoError("the file was altered, reordered or is not for you") from error
+                writer.write(plain)
+                done += len(plain)
+                index += 1
+                if progress:
+                    progress(done, plain_size)
+                if final:
+                    break
+                chunk = following
+        if done != plain_size:
+            raise CryptoError("the file has the wrong size")
+        os.replace(partial, target)
+    finally:
+        if os.path.exists(partial):
+            os.unlink(partial)
 
 
 def encrypt_message(plaintext: bytes, me: Identity, my_name: str, recipients: dict[str, Bundle],

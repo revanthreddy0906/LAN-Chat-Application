@@ -1,5 +1,7 @@
 """The end-to-end encryption building blocks: known answers, round trips, and everything that must fail."""
 
+import os
+import tempfile
 import unittest
 
 import e2ee
@@ -302,6 +304,124 @@ class MessageEncryptionTest(unittest.TestCase):
                                      {"Bob": self.bob.public(), "Carol": self.carol.public()})
         self.assertEqual(self.open(group, self.carol, "Carol"), "meet at noon")
         self.assertLess(e2ee.envelope_size(group) - e2ee.envelope_size(solo), 450)
+
+
+@needs_crypto
+class FileEncryptionTest(unittest.TestCase):
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        self.key = e2ee.new_file_key()
+
+    def path(self, name):
+        return os.path.join(self.dir, name)
+
+    def make(self, size):
+        data = os.urandom(size)
+        with open(self.path("plain"), "wb") as handle:
+            handle.write(data)
+        return data
+
+    def encrypt(self, size):
+        data = self.make(size)
+        cipher_size, digest = e2ee.encrypt_file(self.path("plain"), self.path("cipher"), self.key)
+        return data, cipher_size, digest
+
+    def test_round_trip_at_every_chunk_boundary(self):
+        chunk = e2ee.FILE_CHUNK
+        for size in (1, 100, chunk - 1, chunk, chunk + 1, 2 * chunk, 3 * chunk + 17, 1_000_000):
+            data, cipher_size, digest = self.encrypt(size)
+            self.assertEqual(cipher_size, e2ee.encrypted_size(size), size)
+            e2ee.decrypt_file(self.path("cipher"), self.path("out"), self.key, size)
+            with open(self.path("out"), "rb") as handle:
+                self.assertEqual(handle.read(), data, size)
+
+    def test_the_digest_is_of_what_the_server_stores(self):
+        import hashlib
+        _data, _size, digest = self.encrypt(200_000)
+        with open(self.path("cipher"), "rb") as handle:
+            self.assertEqual(hashlib.sha256(handle.read()).hexdigest(), digest)
+
+    def test_the_encrypted_file_hides_the_content(self):
+        marker = b"VISIBLE-PLAINTEXT-MARKER" * 100
+        with open(self.path("plain"), "wb") as handle:
+            handle.write(marker)
+        e2ee.encrypt_file(self.path("plain"), self.path("cipher"), self.key)
+        with open(self.path("cipher"), "rb") as handle:
+            self.assertNotIn(b"VISIBLE-PLAINTEXT-MARKER", handle.read())
+
+    def test_a_flipped_byte_anywhere_is_caught(self):
+        _data, cipher_size, _digest = self.encrypt(3 * e2ee.FILE_CHUNK + 5)
+        for position in (0, e2ee.FILE_CHUNK + 20, cipher_size - 1):
+            with open(self.path("cipher"), "rb") as handle:
+                raw = bytearray(handle.read())
+            raw[position] ^= 1
+            with open(self.path("bad"), "wb") as handle:
+                handle.write(raw)
+            with self.assertRaises(CryptoError, msg=position):
+                e2ee.decrypt_file(self.path("bad"), self.path("out"), self.key, 3 * e2ee.FILE_CHUNK + 5)
+            self.assertFalse(os.path.exists(self.path("out")))
+            self.assertFalse(os.path.exists(self.path("out.part")))
+
+    def test_dropping_reordering_or_adding_chunks_is_caught(self):
+        size = 3 * e2ee.FILE_CHUNK
+        self.encrypt(size)
+        full = e2ee.FILE_CHUNK + e2ee.FILE_TAG
+        with open(self.path("cipher"), "rb") as handle:
+            raw = handle.read()
+        chunks = [raw[i:i + full] for i in range(0, len(raw), full)]
+        for name, damaged in (("truncated", b"".join(chunks[:-1])), ("swapped", b"".join([chunks[1], chunks[0], chunks[2]])),
+                              ("extended", raw + chunks[0]), ("empty", b"")):
+            with open(self.path("bad"), "wb") as handle:
+                handle.write(damaged)
+            with self.assertRaises(CryptoError, msg=name):
+                e2ee.decrypt_file(self.path("bad"), self.path("out"), self.key, size)
+
+    def test_a_truncation_at_a_chunk_boundary_cannot_pass_as_the_whole_file(self):
+        # the first two chunks of a longer file, presented as a two-chunk file: the 'final' flag is wrong
+        self.encrypt(3 * e2ee.FILE_CHUNK)
+        full = e2ee.FILE_CHUNK + e2ee.FILE_TAG
+        with open(self.path("cipher"), "rb") as handle:
+            head = handle.read(2 * full)
+        with open(self.path("bad"), "wb") as handle:
+            handle.write(head)
+        with self.assertRaises(CryptoError):
+            e2ee.decrypt_file(self.path("bad"), self.path("out"), self.key, 2 * e2ee.FILE_CHUNK)
+
+    def test_wrong_key_wrong_size_and_empty_file(self):
+        self.encrypt(10_000)
+        with self.assertRaises(CryptoError):
+            e2ee.decrypt_file(self.path("cipher"), self.path("out"), e2ee.new_file_key(), 10_000)
+        for wrong in (9_999, 10_001, 70_000):
+            with self.assertRaises(CryptoError):
+                e2ee.decrypt_file(self.path("cipher"), self.path("out"), self.key, wrong)
+        with open(self.path("plain"), "wb"):
+            pass
+        with self.assertRaises(CryptoError):
+            e2ee.encrypt_file(self.path("plain"), self.path("cipher"), self.key)
+
+    def test_progress_is_reported_and_ends_complete(self):
+        calls = []
+        self.make(200_000)
+        e2ee.encrypt_file(self.path("plain"), self.path("cipher"), self.key, lambda done, total: calls.append((done, total)))
+        self.assertEqual(calls[-1], (200_000, 200_000))
+        self.assertEqual([c[0] for c in calls], sorted(c[0] for c in calls))
+
+    def test_file_info_validation(self):
+        good = {"name": "a.png", "mime": "image/png", "kind": "image", "size": 5, "key": e2ee.b64(self.key)}
+        self.assertIs(e2ee.file_info(good), good)
+        for change in ({"name": ""}, {"name": 5}, {"size": 0}, {"size": True}, {"size": "5"}, {"kind": "exe"},
+                       {"key": "AAAA"}, {"key": 5}, {"mime": "x" * 200}):
+            self.assertIsNone(e2ee.file_info({**good, **change}), change)
+        self.assertIsNone(e2ee.file_info(None))
+        self.assertIsNone(e2ee.file_info({"name": "a"}))
+
+    def test_a_payload_carries_the_file_description_and_rejects_a_bad_one(self):
+        info = {"name": "a.png", "mime": "image/png", "kind": "image", "size": 5, "key": e2ee.b64(self.key)}
+        payload = e2ee.decode_payload(e2ee.encode_payload("caption", info))
+        self.assertEqual(payload["f"], info)
+        self.assertNotIn("f", e2ee.decode_payload(e2ee.encode_payload("no file")))
+        with self.assertRaises(CryptoError):
+            e2ee.decode_payload(e2ee.encode_payload("x", {"name": "a", "size": 1}))
 
 
 class WithoutThePackageTest(unittest.TestCase):

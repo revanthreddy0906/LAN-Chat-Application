@@ -255,6 +255,7 @@ class Record:
     sender: str = ""  # who actually wrote it (for private messages `name` is the other person)
     ts: float = 0.0  # the server's time stamp, for searching decrypted text
     enc: dict | None = None  # an end-to-end encrypted envelope, until it has been read
+    file: dict | None = None  # for an encrypted file message: what the file is and its key (from the payload)
     secure: str = ""  # "", "pending", "e2ee", "locked" or "failed": the state of an encrypted message
     att: dict | None = None  # a shared file: {id, name, mime, size, kind, sha256}
     media: dict = field(default_factory=dict)  # what the window knows about it: status, pct, photo, path...
@@ -625,6 +626,17 @@ class MessageList(tk.Frame):
         """A picture shown inline, or a card for any other file, with the actions that make sense."""
         attachment, media, f = record.att, record.media, self.f
         kind = attachment["kind"]
+        if kind == "encrypted":  # not opened yet (keys locked) or not openable
+            card = tk.Frame(bubble, bg=bubble_bg)
+            card.pack(anchor="w", fill="x", pady=(2, 4))
+            tk.Label(card, text="\U0001F512", bg=bubble_bg, fg=text_fg, font=(f.body[0], 26)).pack(side="left", padx=(0, 10))
+            info = tk.Frame(card, bg=bubble_bg)
+            info.pack(side="left")
+            tk.Label(info, text="Encrypted file", bg=bubble_bg, fg=text_fg, font=f.small_bold).pack(anchor="w")
+            detail = {"failed": "could not be opened", "locked": "unlock your keys to open it"}.get(record.secure, "opening…")
+            tk.Label(info, text=f"{self._human_size(attachment['size'])} · {detail}", bg=bubble_bg, fg=time_fg,
+                     font=f.tiny).pack(anchor="w")
+            return
         size_text = self._human_size(attachment["size"])
         photo = media.get("photo")
         if kind == "image" and photo is not None:

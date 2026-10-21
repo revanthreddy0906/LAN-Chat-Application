@@ -17,6 +17,7 @@ import e2ee
 from e2ee import Bundle, CryptoError, Identity
 from events import snippet, snippet_around
 from keystore import KeyStore, server_id
+from storage import sanitize_name
 
 MIN_PASSPHRASE = 8
 
@@ -308,33 +309,19 @@ class E2EEManager:
             return f"⚠ Private to {name} · their security code changed"
         return f"\U0001F512 End-to-end encrypted with {name}" + (" ✔" if self.store.is_verified(name) else "")
 
-    def send_private(self, text: str, to: str, reply_id: int | None, done: Callable[[dict | None], None]) -> None:
-        """Turn a private message into the event to send: encrypted when possible, plain only if allowed.
-
-        `done(event)` gets the event, or None when the message was refused (the reason is shown)."""
+    def _resolve(self, to: str, plain: Callable[[], None], refuse: Callable[[str], None],
+                 secure: Callable[[Bundle], None]) -> None:
+        """Decide how to reach `to`: send plain (only if allowed), refuse with a reason, or encrypt for their key."""
         app = self.app
-        extra = {"reply_to": reply_id} if reply_id else {}
-
-        def plain() -> None:
-            done({"t": "send", "to": to, "body": text, **extra})
-
-        def refuse(reason: str) -> None:
-            app.notice(reason)
-            done(None)
-
         if not e2ee.AVAILABLE or self.policy == "off":
             plain()
             return
         if self.state != "ready":
             if self.policy == "required":
-                refuse("This server requires end-to-end encryption for private messages. "
+                refuse("This server requires end-to-end encryption for private messages and files. "
                        "Set up or unlock your keys first (⋯ → Encryption keys…).")
             else:
                 plain()
-            return
-        size = len(text.encode("utf-8"))
-        if size > e2ee.MAX_TEXT_BYTES:
-            refuse(f"Encrypted messages can be up to {e2ee.MAX_TEXT_BYTES} bytes; this one is {size}. Please shorten it.")
             return
 
         def go() -> None:
@@ -345,9 +332,9 @@ class E2EEManager:
                     return
                 if to.lower() not in self.plain_ok:
                     if not app.confirm(f"{to} has no encryption keys",
-                                       f"{to} has not set up end-to-end encryption, so this message could be read by "
+                                       f"{to} has not set up end-to-end encryption, so this could be read by "
                                        "the server (it is still protected on the network by TLS). Send it anyway?"):
-                        done(None)
+                        refuse("")
                         return
                     self.plain_ok.add(to.lower())
                 plain()
@@ -356,7 +343,7 @@ class E2EEManager:
             if status == "changed":
                 self.changed.add(to.lower())
                 app._render_users()
-                refuse(f"⚠ {to}'s security code changed, so this message was not sent. Check it with them, then accept "
+                refuse(f"⚠ {to}'s security code changed, so nothing was sent. Check it with them, then accept "
                        f"the new code (right-click {to} → Verify security code).")
                 app.root.after_idle(lambda: self.open_verify(to))
                 return
@@ -364,11 +351,48 @@ class E2EEManager:
                 self.store.pin_contact(to, bundle)
                 app.notice(f"Messages with {to} are now end-to-end encrypted. To be sure it really is {to}, compare "
                            "security codes (right-click their name → Verify security code).", tone="system")
-            envelope = e2ee.encrypt_message(e2ee.encode_payload(text), self.identity, app.username, {to: bundle})
-            done({"t": "send", "to": to, "enc": envelope, **extra})
+            secure(bundle)
             app._update_private_chip()
 
         self.ensure_contacts([to], go)
+
+    def send_private(self, text: str, to: str, reply_id: int | None, done: Callable[[dict | None], None]) -> None:
+        """Turn a private message into the event to send: encrypted when possible, plain only if allowed.
+
+        `done(event)` gets the event, or None when the message was refused (the reason is shown)."""
+        app = self.app
+        extra = {"reply_to": reply_id} if reply_id else {}
+        size = len(text.encode("utf-8"))
+        if self.state == "ready" and e2ee.AVAILABLE and self.policy != "off" and size > e2ee.MAX_TEXT_BYTES:
+            app.notice(f"Encrypted messages can be up to {e2ee.MAX_TEXT_BYTES} bytes; this one is {size}. Please shorten it.")
+            done(None)
+            return
+
+        def refuse(reason: str) -> None:
+            if reason:
+                app.notice(reason)
+            done(None)
+
+        def secure(bundle: Bundle) -> None:
+            envelope = e2ee.encrypt_message(e2ee.encode_payload(text), self.identity, app.username, {to: bundle})
+            done({"t": "send", "to": to, "enc": envelope, **extra})
+
+        self._resolve(to, lambda: done({"t": "send", "to": to, "body": text, **extra}), refuse, secure)
+
+    def plan_file(self, to: str, decided: Callable[[object], None]) -> None:
+        """How should a file for `to` travel? `decided` gets "plain", "refuse" or the recipient's key bundle."""
+        def refuse(reason: str) -> None:
+            if reason:
+                self.app.notice(reason)
+            decided("refuse")
+
+        self._resolve(to, lambda: decided("plain"), refuse, decided)
+
+    def file_envelope(self, to: str, bundle: Bundle, caption: str, description: dict) -> dict | None:
+        """The encrypted message that accompanies an encrypted file (its name, type, key and caption)."""
+        envelope = e2ee.encrypt_message(e2ee.encode_payload(caption, description), self.identity,
+                                        self.app.username, {to: bundle})
+        return envelope if e2ee.envelope_size(envelope) <= e2ee.MAX_ENVELOPE_CHARS else None
 
     def edit_event(self, record, text: str) -> dict | None:
         """The edit event for one of my encrypted messages (a new envelope), or None if it cannot be made."""
@@ -386,7 +410,11 @@ class E2EEManager:
         if size > e2ee.MAX_TEXT_BYTES:
             app.notice(f"Encrypted messages can be up to {e2ee.MAX_TEXT_BYTES} bytes; this one is {size}.")
             return None
-        envelope = e2ee.encrypt_message(e2ee.encode_payload(text), self.identity, app.username, {record.name: bundle})
+        envelope = e2ee.encrypt_message(e2ee.encode_payload(text, record.file), self.identity, app.username,
+                                        {record.name: bundle})
+        if e2ee.envelope_size(envelope) > e2ee.MAX_ENVELOPE_CHARS:
+            app.notice("That caption is too long for an encrypted file message.")
+            return None
         return {"t": "edit", "id": record.id, "enc": envelope}
 
     def schedule_decrypt(self) -> None:
@@ -461,10 +489,26 @@ class E2EEManager:
             if earlier is not None and earlier != record.id:
                 fail("it is a copy of an earlier message (possible replay)")
                 continue
+            if record.att and record.att.get("kind") == "encrypted" and not payload.get("f"):
+                fail("the description of the file is missing")
+                continue
             self.seen_mids[payload["mid"]] = record.id
             record.text, record.secure = payload["b"], "e2ee"
+            if payload.get("f") and record.att:
+                self._attach_file(record, payload["f"])
             app.messages.refresh(record)
+            if record.file:
+                app.media.ensure_preview(record)
         self._fix_replies()
+
+    @staticmethod
+    def _attach_file(record, info: dict) -> None:
+        """The message says what the file is: show that, and remember the key that opens it."""
+        original = record.att
+        record.file = info
+        record.att = {"id": original["id"], "name": sanitize_name(info["name"]), "mime": info["mime"],
+                      "size": info["size"], "kind": info["kind"], "sha256": original["sha256"],
+                      "key": info["key"], "cipher_size": original.get("cipher_size", original["size"])}
 
     def _fix_replies(self) -> None:
         """Quote encrypted messages in replies, now that this window can read them."""

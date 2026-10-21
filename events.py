@@ -154,9 +154,12 @@ def legacy_text(event: dict, viewer: str) -> str | None:
         return None
     stamp = clock(event["ts"])
     sender, recipient, body = event["sender"], event.get("to"), event["body"]
+    attachment = event.get("att")
     if event.get("enc"):  # a terminal cannot decrypt; say what it is
         body = "[encrypted message: open the chat window to read it]"
-    attachment = event.get("att")
+        if attachment and attachment.get("kind") == "encrypted":
+            body = "[encrypted file: open the chat window to open it]"
+            attachment = None
     if attachment:  # a terminal client cannot open files; tell it what was shared
         shared = f"[{attachment['kind']}: {attachment['name']}]"
         body = f"{shared} {body}".strip()

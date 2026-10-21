@@ -803,7 +803,7 @@ class ChatServer(AdminMixin, KeysMixin):
         body = body.strip()
         if not body and attachment is None and enc is None:
             return None
-        if to_name is not None and enc is None and attachment is None and self.e2ee_policy == "required":
+        if to_name is not None and enc is None and self.e2ee_policy == "required":
             self._error(sender, "this server requires end-to-end encryption for private messages: "
                                 "use the chat window and unlock your keys.")
             return None
@@ -1129,14 +1129,25 @@ class ChatServer(AdminMixin, KeysMixin):
             return deny("your role cannot share files.")
         name, size, sha = event.get("name"), event.get("size"), event.get("sha256")
         caption, to_name, reply_to = event.get("caption") or "", event.get("to"), event.get("reply_to")
+        enc = event.get("enc")  # an end-to-end encrypted file: the server sees only ciphertext and its size
+        if enc is not None:
+            name, caption = "encrypted file", ""
         if not isinstance(name, str) or not isinstance(caption, str):
             return deny("malformed upload.")
         if not isinstance(size, int) or isinstance(size, bool) or not isinstance(sha, str):
             return deny("malformed upload.")
         if to_name is not None and not isinstance(to_name, str):
             return deny("malformed upload.")
+        envelope = None
+        if enc is not None:
+            envelope = self._checked_envelope(client, enc, to_name)
+            if envelope is None:
+                return deny("that encrypted file message is not acceptable.")
+        elif to_name is not None and self.e2ee_policy == "required":
+            return deny("this server requires end-to-end encryption for private files: use the chat window "
+                        "and unlock your keys.")
         name = sanitize_name(name)
-        if is_blocked(name, self.blocked_extensions):
+        if envelope is None and is_blocked(name, self.blocked_extensions):
             return deny(f"{name.rsplit('.', 1)[-1]} files are not allowed here.")
         if size <= 0:
             return deny("that file is empty.")
@@ -1153,7 +1164,8 @@ class ChatServer(AdminMixin, KeysMixin):
             return deny("that conversation is not available.")
         token = self._issue_ticket(
             client, "up", name=name, size=size, sha256=sha, caption=caption.strip(), to=to_name,
-            reply_to=reply_to, mime=mime_for(name), file_kind=kind_for(name),
+            reply_to=reply_to, mime="application/octet-stream" if envelope else mime_for(name),
+            file_kind="encrypted" if envelope else kind_for(name), enc=envelope,
         )
         if token is None:
             return deny("too many uploads at once; try again in a moment.")
@@ -1223,12 +1235,13 @@ class ChatServer(AdminMixin, KeysMixin):
             attachment = {"sha256": ticket["sha256"], "name": ticket["name"], "mime": ticket["mime"],
                           "size": ticket["size"], "kind": ticket["file_kind"]}
             message_id = self._post_message(client, ticket["caption"], to_name=ticket["to"],
-                                            reply_to=ticket["reply_to"], attachment=attachment)
+                                            reply_to=ticket["reply_to"], attachment=attachment,
+                                            enc=ticket.get("enc"))
             if message_id is None:
                 send_message(connection, "ERROR: the message could not be posted")
                 return
             self._log(GREEN, f"{client.username} shared {ticket['name']} ({human_size(ticket['size'])})")
-            self.audit(client.username, "file_shared", ticket["name"],
+            self.audit(client.username, "file_shared", ticket["name"] if not ticket.get("enc") else "(encrypted)",
                        f"{human_size(ticket['size'])}, sha256 {ticket['sha256'][:12]}")
             send_message(connection, encode({"t": "upload_done", "id": message_id}))
         except (OSError, ValueError):
