@@ -78,6 +78,7 @@ def message_event(
                 "sender": parent.sender,
                 "snippet": "" if parent.deleted_at else snippet(parent.body),
                 "deleted": bool(parent.deleted_at),
+                "encrypted": bool(parent.enc),  # the server cannot quote it; the window fills it in
             }
     return {
         "t": "message",
@@ -95,6 +96,7 @@ def message_event(
         "everyone": message.mention_all,
         "history": history,
         "att": attachment,
+        "enc": json.loads(message.enc) if message.enc else None,
     }
 
 
@@ -152,6 +154,8 @@ def legacy_text(event: dict, viewer: str) -> str | None:
         return None
     stamp = clock(event["ts"])
     sender, recipient, body = event["sender"], event.get("to"), event["body"]
+    if event.get("enc"):  # a terminal cannot decrypt; say what it is
+        body = "[encrypted message: open the chat window to read it]"
     attachment = event.get("att")
     if attachment:  # a terminal client cannot open files; tell it what was shared
         shared = f"[{attachment['kind']}: {attachment['name']}]"

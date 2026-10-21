@@ -50,6 +50,12 @@ class DirectoryTest(KeysTestCase):
         self.assertEqual(bundle, identity.public())
         self.assertTrue(bundle.verify())
 
+    def test_a_first_publication_tells_others_to_look_again(self):
+        alice, bob = self.v2("Alice"), self.v2("Bob")
+        self.publish(alice, Identity.generate())
+        alert = bob.until(lambda e: e["t"] == "key_changed", limit=300)
+        self.assertEqual((alert["user"], alert["created"]), ("Alice", True))
+
     def test_publishing_the_same_keys_again_changes_nothing(self):
         alice = self.v2("Alice")
         identity = Identity.generate()
@@ -62,7 +68,7 @@ class DirectoryTest(KeysTestCase):
         self.publish(alice, Identity.generate())
         new = Identity.generate()
         self.assertEqual(self.publish(alice, new, req=2)["status"], "changed")
-        alert = bob.until(lambda e: e["t"] == "key_changed", limit=300)
+        alert = bob.until(lambda e: e["t"] == "key_changed" and not e.get("created"), limit=300)
         self.assertEqual((alert["user"], alert["fingerprint"]), ("Alice", new.public().fingerprint()))
         self.assertIn("keys_changed", [r["action"] for r in self.server.store.audit_rows(limit=50)])
         self.assertEqual(self.server.store.get_user_keys(1)["version"], 2)
@@ -92,7 +98,7 @@ class DirectoryTest(KeysTestCase):
         self.publish(alice, identity, e2ee.make_backup(identity, code))
         alice.send(t="keys_reset", req=6)
         self.assertEqual(alice.until(lambda e: e["t"] == "keys_result" and e["req"] == 6, limit=300)["status"], "reset")
-        alert = bob.until(lambda e: e["t"] == "key_changed", limit=300)
+        alert = bob.until(lambda e: e["t"] == "key_changed" and e.get("reset"), limit=300)
         self.assertTrue(alert["reset"])
         self.assertEqual(self.lookup(bob, "Alice"), {})
         self.assertIsNone(self.server.store.get_backup(1))
@@ -151,6 +157,14 @@ class PolicyTest(KeysTestCase):
         self.assertEqual(admin.until(lambda e: e["t"] == "admin_settings", limit=300)["e2ee_policy"], "required")
         later = self.v2("Later")
         self.assertEqual(later.welcome["e2ee"]["policy"], "required")
+
+    def test_a_policy_change_reaches_every_connected_client_at_once(self):
+        alice, bob = self.v2("Alice"), self.v2("Bob")
+        self.server.set_e2ee_policy("required")
+        for peer in (alice, bob):
+            self.assertEqual(peer.until(lambda e: e["t"] == "e2ee_policy", limit=300)["policy"], "required")
+        with self.assertRaises(ValueError):
+            self.server.set_e2ee_policy("whenever")
 
     def test_garbage_in_the_database_falls_back_to_optional(self):
         self.server.store.set_setting("e2ee_policy", "nonsense")

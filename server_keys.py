@@ -56,10 +56,11 @@ class KeysMixin:
             self.store.set_backup(client.user_id, json.dumps(backup))
         if status != "same":
             self.audit(client.username, f"keys_{status}", detail=f"fingerprint {bundle.fingerprint()[:16]}")
-        if status == "changed":
+        if status in ("changed", "created"):  # created: people who found no keys for them should look again
             with self._lock:
                 others = [c for c in self._clients.values() if c is not client]
-            self._emit({"t": "key_changed", "user": client.username, "fingerprint": bundle.fingerprint()}, others)
+            self._emit({"t": "key_changed", "user": client.username, "fingerprint": bundle.fingerprint(),
+                        "created": status == "created"}, others)
         self._keys_reply(client, req, True, status=status, fingerprint=bundle.fingerprint())
 
     def _on_keys_get(self, client, event: dict) -> None:
@@ -85,11 +86,18 @@ class KeysMixin:
             self._emit({"t": "key_changed", "user": client.username, "reset": True}, others)
         self._keys_reply(client, event.get("req"), True, status="reset" if had else "none")
 
-    def _admin_e2ee_policy(self, client, req, value, _unused) -> None:
-        """set_setting helper: only admins reach this through `_admin_set_setting`."""
-        if not can(client.role, "manage_settings") or value not in E2EE_POLICIES:
+    def set_e2ee_policy(self, value: str) -> None:
+        """Change the policy and tell every connected window straight away."""
+        if value not in E2EE_POLICIES:
             raise ValueError("the policy must be off, optional or required.")
         self.store.set_setting("e2ee_policy", value)
+        self._emit({"t": "e2ee_policy", "policy": value})
+
+    def _admin_e2ee_policy(self, client, req, value, _unused) -> None:
+        """set_setting helper: only admins reach this through `_admin_set_setting`."""
+        if not can(client.role, "manage_settings"):
+            raise ValueError("only admins can change the policy.")
+        self.set_e2ee_policy(value)
 
     HANDLERS = {
         "keys_publish": _on_keys_publish, "keys_get": _on_keys_get,

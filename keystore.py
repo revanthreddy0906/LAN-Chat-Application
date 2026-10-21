@@ -19,6 +19,7 @@ import e2ee
 from e2ee import Bundle, CryptoError, Identity
 
 VERSION = 1
+MAX_PREVIOUS_KEYS = 5
 
 
 def server_id(fingerprint: str | None, host: str = "", port: int = 0) -> str:
@@ -111,6 +112,19 @@ class KeyStore:
         with self._lock:
             return self._contacts().get(name.lower())
 
+    def bundles_for(self, name: str) -> list[Bundle]:
+        """The key I pinned for this person, then the ones it replaced (newest first)."""
+        known = self.contact(name)
+        if known is None:
+            return []
+        found = []
+        for data in [known["bundle"]] + list(known.get("previous", [])):
+            try:
+                found.append(Bundle.from_dict(data))
+            except CryptoError:
+                continue
+        return found
+
     def check_contact(self, name: str, bundle: Bundle) -> str:
         """'new' (never seen), 'same' (matches the pin) or 'changed' (a different key than before)."""
         known = self.contact(name)
@@ -124,7 +138,11 @@ class KeyStore:
             contacts = self._contacts()
             known = contacts.get(name.lower())
             same = known is not None and known["fp"] == bundle.fingerprint()
+            previous = list(known.get("previous", [])) if known else []
+            if known is not None and not same:  # keep the old key so earlier messages can still be checked
+                previous = ([known["bundle"]] + previous)[:MAX_PREVIOUS_KEYS]
             contacts[name.lower()] = {"name": name, "fp": bundle.fingerprint(), "bundle": bundle.to_dict(),
+                                      "previous": previous,
                                       "verified": bool(verified or (same and known.get("verified")))}
             self._write(self.contacts_path, contacts)
 

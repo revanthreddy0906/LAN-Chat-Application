@@ -142,6 +142,7 @@ class App:
         self.tls_context = None
         self.media = MediaManager(self)
         self.e2ee = E2EEManager(self)
+        self._private_send_busy = False
         self.session_token: str | None = None
         self.admin_console: AdminConsole | None = None
         self._password_dialog: dict | None = None
@@ -832,6 +833,8 @@ class App:
 
     def _start_private(self, name: str) -> None:
         self.private_to = None if (self.private_to or "").lower() == name.lower() else name
+        if self.private_to:
+            self.e2ee.ensure_contacts([self.private_to], self._update_private_chip)
         self._update_private_chip()
         self._render_users()
         self.message_entry.focus()
@@ -843,7 +846,7 @@ class App:
 
     def _update_private_chip(self) -> None:
         if self.private_to:
-            self.private_label.configure(text=f"\U0001F512 Private to {self.private_to}")
+            self.private_label.configure(text=self.e2ee.private_label(self.private_to))
             self.private_chip.pack(anchor="w", before=self.composer_row)
         else:
             self.private_chip.pack_forget()
@@ -989,7 +992,10 @@ class App:
     def _ev_search_results(self, event: dict) -> None:
         if event.get("req") != self.search_req:
             return  # an older search that was already replaced
-        self.search_results = event.get("results", [])
+        found = event.get("results", [])
+        seen = {r["id"] for r in found}
+        local = [r for r in self.e2ee.search_local(self.search_entry.get()) if r["id"] not in seen]
+        self.search_results = sorted(found + local, key=lambda r: r["ts"], reverse=True)[:40]
         self._render_search()
 
     # ----- pinned messages
@@ -1173,20 +1179,37 @@ class App:
             self.leave()
             return "break"
         if self.editing is not None:
-            event = {"t": "edit", "id": self.editing.id, "body": text}
+            if self.editing.secure == "e2ee":
+                event = self.e2ee.edit_event(self.editing, text)
+                if event is None:
+                    return "break"
+            else:
+                event = {"t": "edit", "id": self.editing.id, "body": text}
+        elif self.private_to and not text.startswith("/"):
+            if not self._private_send_busy:
+                self._private_send_busy = True
+                self.e2ee.send_private(text, self.private_to, self.reply_to.id if self.reply_to else None,
+                                       self._private_send_done)
+            return "break"
         else:
             event = {"t": "send", "body": text}
-            if not text.startswith("/"):
-                if self.reply_to is not None:
-                    event["reply_to"] = self.reply_to.id
-                if self.private_to:
-                    event["to"] = self.private_to
+            if not text.startswith("/") and self.reply_to is not None:
+                event["reply_to"] = self.reply_to.id
         if self._send_event(event):
-            self.message_entry.clear()
-            self._stop_typing()
-            self._clear_context()
-            self._hide_mentions()
+            self._after_sent()
         return "break"
+
+    def _after_sent(self) -> None:
+        self.message_entry.clear()
+        self._stop_typing()
+        self._clear_context()
+        self._hide_mentions()
+
+    def _private_send_done(self, event: dict | None) -> None:
+        """The encryption step finished: `event` is what to send (encrypted or plain), or None if it was refused."""
+        self._private_send_busy = False
+        if event is not None and self._send_event(event):
+            self._after_sent()
 
     # ----- account menu, password, data export, admin console
 
@@ -1466,6 +1489,11 @@ class App:
 
     _ev_keys_result = _ev_keys = _ev_keys_backup = _ev_key_changed = _e2ee_event
 
+    def _ev_e2ee_policy(self, event: dict) -> None:
+        self.e2ee.policy = event.get("policy", "optional")
+        self._update_private_chip()
+        self.notice(f"The end-to-end encryption policy of this chat is now: {self.e2ee.policy}.", tone="system")
+
     def confirm(self, title: str, text: str) -> bool:
         return messagebox.askyesno(title, text, parent=self.root)
 
@@ -1495,10 +1523,13 @@ class App:
             edited=bool(event.get("edited")), deleted=bool(event.get("deleted")),
             reactions=[(r["emoji"], list(r["users"])) for r in event.get("reactions", [])],
             mentioned=(not mine) and not event.get("to") and mentions_me(event, self.username),
+            sender=event["sender"], ts=event["ts"],
+            enc=event.get("enc"), secure="pending" if event.get("enc") else "",
         )
+        body = "\U0001F512 Encrypted message" if event.get("enc") else event["body"]
         if event.get("to"):
-            return Record("private", event["body"], name=event["to"] if mine else event["sender"], **common)
-        return Record("chat", event["body"], name=event["sender"], **common)
+            return Record("private", body, name=event["to"] if mine else event["sender"], **common)
+        return Record("chat", body, name=event["sender"], **common)
 
     def _ev_welcome(self, event: dict) -> None:
         self.limits = event.get("limits") or {}
@@ -1537,6 +1568,7 @@ class App:
         self._update_seen()
         self.messages.scroll_to_bottom()
         self._report_read()
+        self.e2ee.schedule_decrypt()
 
     def _ev_message(self, event: dict) -> None:
         record = self._record_from_event(event)
@@ -1546,14 +1578,18 @@ class App:
             return
         existing = self.messages.record_for(record.id)
         if existing is not None:  # already on screen (history replayed after a reconnect)
-            self.messages.update(record.id, text=record.text, edited=record.edited,
-                                 deleted=record.deleted, reactions=record.reactions)
+            if record.enc and existing.secure == "e2ee" and existing.enc == record.enc:
+                record.text, record.secure = existing.text, "e2ee"  # keep what was already decrypted
+            self.messages.update(record.id, text=record.text, edited=record.edited, deleted=record.deleted,
+                                 reactions=record.reactions, enc=record.enc, secure=record.secure)
+            self.e2ee.schedule_decrypt()
             return
         if event.get("history") and not self.divider_added and not record.mine and record.id > self.last_read:
             self.messages.add(Record("notice", "New messages", tone="divider"))
             self.divider_added = True
         self.messages.add(record)
         self.latest_id = max(self.latest_id, record.id)
+        self.e2ee.schedule_decrypt()
         self.typing.pop(event["sender"], None)
         if event.get("history"):
             return
@@ -1599,10 +1635,15 @@ class App:
         self._refresh_typing()
 
     def _ev_edited(self, event: dict) -> None:
+        if event.get("enc"):
+            self.messages.update(event["id"], text="\U0001F512 Encrypted message", enc=event["enc"],
+                                 secure="pending", edited=True)
+            self.e2ee.schedule_decrypt()
+            return
         self.messages.update(event["id"], text=event["body"], edited=True)
 
     def _ev_deleted(self, event: dict) -> None:
-        self.messages.update(event["id"], text="", deleted=True, reactions=[], seen_by=[])
+        self.messages.update(event["id"], text="", deleted=True, reactions=[], seen_by=[], enc=None, secure="")
         if self.editing is not None and self.editing.id == event["id"]:
             self._cancel_context()
         if self.reply_to is not None and self.reply_to.id == event["id"]:

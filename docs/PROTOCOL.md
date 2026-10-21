@@ -37,11 +37,12 @@ Every v2 frame is a JSON object with a `"t"` field.
 | `pins`, `search_results` | Pinned list; results for a `search` (carries the request's `req`). |
 | `page_start` / `page_end` | Bracket an older page requested with `history`. |
 | `upload_ready`, `upload_denied`, `download_ready`, `transfer_error` | File transfer control (below). |
+| `keys_result`, `keys`, `keys_backup`, `key_changed`, `e2ee_policy` | Public-key directory replies, notices that someone's key appeared or changed, and live policy changes. |
 | `passwd_result`, `admin_users`, `admin_audit`, `admin_verify`, `admin_settings`, `admin_result` | Account and admin replies. |
 
 **Client to server**
 
-`send {body, to?, reply_to?}`, `edit {id, body}`, `delete {id}`, `react {id, emoji}`, `typing {on}`, `presence {status}`, `read {up_to}`, `members`, `ping`, `pin {id, on}`, `search {q, req}`, `history {before, limit}`, `upload {req, name, size, sha256, to?, caption?, reply_to?}`, `download {req, id}`, `passwd {old, new}`, `logout`, `export {req}`, and for admins `admin_users {page}`, `admin {op, user, value}`, `admin_settings`, `admin_audit {actor?, action?, before?}`, `admin_verify`.
+`send {body, to?, reply_to?}`, `edit {id, body}`, `delete {id}`, `react {id, emoji}`, `typing {on}`, `presence {status}`, `read {up_to}`, `members`, `ping`, `pin {id, on}`, `search {q, req}`, `history {before, limit}`, `upload {req, name, size, sha256, to?, caption?, reply_to?}`, `download {req, id}`, `passwd {old, new}`, `logout`, `export {req}`, `keys_publish {dh, sign, sig, backup?}`, `keys_get {names}`, `keys_backup_get`, `keys_reset`, and for admins `admin_users {page}`, `admin {op, user, value}`, `admin_settings`, `admin_audit {actor?, action?, before?}`, `admin_verify`.
 
 Slash commands typed in a `send` body (`/search`, `/pins`, `/passwd`, `/msg`, `/help`) are handled too, so the same words work in both clients.
 
@@ -58,3 +59,7 @@ Limits: message text 3400 bytes; frames 4096 bytes. `fit_frame` trims an oversiz
 ## v1 compatibility
 
 `legacy_text(event, viewer)` renders `message` and `notice` events as the familiar `[HH:MM] Name: text` lines (files appear as `[image: name]`) and returns nothing for events a terminal client cannot show.
+
+## End-to-end encrypted messages
+
+A private `send` may carry `enc` instead of `body`: `{"v":2,"n":nonce,"ct":ciphertext,"k":{"alice":sealed key,"bob":sealed key},"sig":signature}`. The text is encrypted once with a random key (ChaCha20-Poly1305); that key is sealed separately for each of the two people (ephemeral and static X25519, HKDF-SHA256) and the whole message is signed with the sender's Ed25519 key. The server checks only the shape: the names in `k` must be exactly the sender and recipient, and the envelope may be at most 3000 characters. It stores the envelope in `messages.enc` with an empty body, and relays it as a `message` event with `"enc"` set. An edit of an encrypted message is another `enc` and never plain text. Terminal clients see `[encrypted message: open the chat window to read it]`.

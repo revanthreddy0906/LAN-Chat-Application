@@ -212,6 +212,98 @@ class SealedMessageTest(unittest.TestCase):
             self.assertEqual(e2ee.open_sealed(envelope, self.bob, self.alice.public(), self.aad), payload)
 
 
+@needs_crypto
+class MessageEncryptionTest(unittest.TestCase):
+    def setUp(self):
+        self.alice, self.bob, self.carol = Identity.generate(), Identity.generate(), Identity.generate()
+
+    def encrypt(self, text="meet at noon", sender="Alice", to="Bob"):
+        recipients = {to: {"Bob": self.bob, "Carol": self.carol}[to].public()}
+        return e2ee.encrypt_message(e2ee.encode_payload(text), self.alice, sender, recipients)
+
+    def open(self, envelope, me, name, sender="Alice", sender_bundle=None):
+        data = e2ee.decrypt_message(envelope, me, name, sender, sender_bundle or self.alice.public())
+        return e2ee.decode_payload(data)["b"]
+
+    def test_both_the_recipient_and_the_sender_can_read_it(self):
+        envelope = self.encrypt()
+        self.assertEqual(self.open(envelope, self.bob, "Bob"), "meet at noon")
+        self.assertEqual(self.open(envelope, self.alice, "alice"), "meet at noon")
+        self.assertEqual(e2ee.envelope_people(envelope), ["alice", "bob"])
+
+    def test_nobody_else_can(self):
+        envelope = self.encrypt()
+        with self.assertRaises(CryptoError):
+            self.open(envelope, self.carol, "Carol")
+        with self.assertRaises(CryptoError):  # even with the right name, the wrong key cannot open the sealed key
+            self.open(envelope, self.carol, "Bob")
+
+    def test_the_text_is_not_visible_and_each_message_is_different(self):
+        one, two = self.encrypt(), self.encrypt()
+        self.assertNotIn(b"meet", e2ee.unb64(one["ct"]))
+        self.assertNotEqual((one["n"], one["ct"]), (two["n"], two["ct"]))
+
+    def test_tampering_is_detected_everywhere(self):
+        envelope = self.encrypt()
+        ct = e2ee.unb64(envelope["ct"])
+        damaged = [dict(envelope, ct=e2ee.b64(bytes([ct[0] ^ 1]) + ct[1:])), dict(envelope, n=e2ee.b64(bytes(12))),
+                   dict(envelope, sig=e2ee.b64(bytes(64))), dict(envelope, v=1)]
+        for bad in damaged:
+            with self.assertRaises(CryptoError):
+                self.open(bad, self.bob, "Bob")
+
+    def test_changing_who_the_message_is_for_breaks_it(self):
+        envelope = self.encrypt()
+        extra = dict(envelope, k={**envelope["k"], "carol": envelope["k"]["bob"]})
+        with self.assertRaises(CryptoError):
+            self.open(extra, self.bob, "Bob")
+        renamed = dict(envelope, k={"eve": envelope["k"]["bob"], "alice": envelope["k"]["alice"]})
+        with self.assertRaises(CryptoError):
+            self.open(renamed, self.bob, "Eve")
+
+    def test_a_message_cannot_be_passed_off_as_from_someone_else(self):
+        envelope = self.encrypt()
+        with self.assertRaises(CryptoError):
+            self.open(envelope, self.bob, "Bob", sender="Carol", sender_bundle=self.carol.public())
+        with self.assertRaises(CryptoError):
+            self.open(envelope, self.bob, "Bob", sender="Alice", sender_bundle=self.carol.public())
+
+    def test_the_recipient_cannot_forge_a_message_from_the_sender(self):
+        forged = e2ee.encrypt_message(e2ee.encode_payload("I owe Bob 100"), self.bob, "Alice",
+                                      {"Bob": self.bob.public()})
+        with self.assertRaises(CryptoError):
+            self.open(forged, self.bob, "Bob")  # signed by Bob's key, not Alice's
+
+    def test_malformed_envelopes(self):
+        for broken in ({}, {"v": 2}, {"v": 2, "k": {}}, {"v": 2, "k": {"bob": 5}, "n": "", "ct": "", "sig": ""},
+                       {"v": 2, "k": {"bob": {}}, "n": 5, "ct": "", "sig": ""}, None, []):
+            with self.assertRaises(CryptoError):
+                self.open(broken, self.bob, "Bob")
+
+    def test_payload_round_trip_and_ids(self):
+        one, two = e2ee.decode_payload(e2ee.encode_payload("hi \u00e9\u4e2d")), e2ee.decode_payload(e2ee.encode_payload("hi"))
+        self.assertEqual(one["b"], "hi \u00e9\u4e2d")
+        self.assertNotEqual(one["mid"], two["mid"])
+        for bad in (b"not json", b"[1]", b'{"b": 5, "mid": "x"}', b"\xff\xfe"):
+            with self.assertRaises(CryptoError):
+                e2ee.decode_payload(bad)
+
+    def test_the_largest_allowed_message_fits_in_the_size_budget(self):
+        names = ("A" * 32, "B" * 32)
+        text = "\u00e9" * (e2ee.MAX_TEXT_BYTES // 2)
+        envelope = e2ee.encrypt_message(e2ee.encode_payload(text), self.alice, names[0], {names[1]: self.bob.public()})
+        self.assertLessEqual(e2ee.envelope_size(envelope), e2ee.MAX_ENVELOPE_CHARS)
+        self.assertEqual(e2ee.decode_payload(e2ee.decrypt_message(envelope, self.bob, names[1], names[0],
+                                                                 self.alice.public()))["b"], text)
+
+    def test_more_than_two_people_costs_only_a_key_each(self):
+        solo = self.encrypt()
+        group = e2ee.encrypt_message(e2ee.encode_payload("meet at noon"), self.alice, "Alice",
+                                     {"Bob": self.bob.public(), "Carol": self.carol.public()})
+        self.assertEqual(self.open(group, self.carol, "Carol"), "meet at noon")
+        self.assertLess(e2ee.envelope_size(group) - e2ee.envelope_size(solo), 450)
+
+
 class WithoutThePackageTest(unittest.TestCase):
     def test_require_explains_what_to_install(self):
         if e2ee.AVAILABLE:

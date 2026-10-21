@@ -207,11 +207,12 @@ class StoredMessage:
     sender_id: int = 0
     recipient_id: int | None = None
     mention_all: bool = False
+    enc: str | None = None  # an end-to-end encrypted envelope (JSON); the server cannot read it
 
 
 _MESSAGE_SELECT = (
     "SELECT m.id, s.username AS sender, r.username AS recipient, m.kind, m.body, m.created_at,"
-    " m.reply_to, m.edited_at, m.deleted_at, m.sender_id, m.recipient_id, m.mention_all"
+    " m.reply_to, m.edited_at, m.deleted_at, m.sender_id, m.recipient_id, m.mention_all, m.enc"
     " FROM messages m JOIN users s ON s.id = m.sender_id"
     " LEFT JOIN users r ON r.id = m.recipient_id"
 )
@@ -221,7 +222,7 @@ def _message(row: sqlite3.Row) -> StoredMessage:
     return StoredMessage(
         row["id"], row["sender"], row["recipient"], row["kind"], row["body"], row["created_at"],
         row["reply_to"], row["edited_at"], row["deleted_at"], row["sender_id"], row["recipient_id"],
-        bool(row["mention_all"]),
+        bool(row["mention_all"]), row["enc"],
     )
 
 
@@ -369,13 +370,14 @@ class Store:
         self, sender_id: int, body: str, recipient_id: int | None = None,
         kind: str = "text", channel_id: int = 1, created_at: float | None = None,
         reply_to: int | None = None, mentions: list[int] | None = None, mention_all: bool = False,
+        enc: str | None = None,
     ) -> int:
         with self._lock:
             cursor = self._db.execute(
-                "INSERT INTO messages (channel_id, sender_id, recipient_id, kind, body, created_at, reply_to, mention_all)"
-                " VALUES (?,?,?,?,?,?,?,?)",
+                "INSERT INTO messages (channel_id, sender_id, recipient_id, kind, body, created_at, reply_to,"
+                " mention_all, enc) VALUES (?,?,?,?,?,?,?,?,?)",
                 (channel_id, sender_id, recipient_id, kind, body, created_at or time.time(), reply_to,
-                 int(mention_all)),
+                 int(mention_all), enc),
             )
             message_id = cursor.lastrowid
             for user_id in dict.fromkeys(mentions or []):
@@ -426,13 +428,14 @@ class Store:
             ).fetchall()
         return [_message(row) for row in reversed(rows)]
 
-    def edit_message(self, message_id: int, user_id: int, new_body: str, when: float | None = None) -> bool:
-        """Change a message's text. Only its author can, and only while it is not deleted."""
+    def edit_message(self, message_id: int, user_id: int, new_body: str, when: float | None = None,
+                     enc: str | None = None) -> bool:
+        """Change a message's text (or its encrypted envelope). Only its author can, and only while it is not deleted."""
         with self._lock:
             cursor = self._db.execute(
-                "UPDATE messages SET body = ?, edited_at = ?"
+                "UPDATE messages SET body = ?, enc = ?, edited_at = ?"
                 " WHERE id = ? AND sender_id = ? AND deleted_at IS NULL",
-                (new_body, when or time.time(), message_id, user_id),
+                (new_body, enc, when or time.time(), message_id, user_id),
             )
             self._db.commit()
             return cursor.rowcount > 0
@@ -441,7 +444,7 @@ class Store:
         """Soft delete: the text is erased, a tombstone row stays so replies keep working."""
         with self._lock:
             cursor = self._db.execute(
-                "UPDATE messages SET body = '', deleted_at = ? WHERE id = ? AND deleted_at IS NULL",
+                "UPDATE messages SET body = '', enc = NULL, deleted_at = ? WHERE id = ? AND deleted_at IS NULL",
                 (when or time.time(), message_id),
             )
             self._db.execute("DELETE FROM reactions WHERE message_id = ?", (message_id,))
@@ -741,7 +744,7 @@ class Store:
         """Everything this person wrote, plus private messages they received (for their data export)."""
         with self._lock:
             rows = self._db.execute(
-                "SELECT m.id, m.created_at, m.body, m.deleted_at, m.edited_at, m.reply_to, r.username AS recipient,"
+                "SELECT m.id, m.created_at, m.body, m.enc, m.deleted_at, m.edited_at, m.reply_to, r.username AS recipient,"
                 " s.username AS sender, a.name AS file_name, a.size AS file_size"
                 " FROM messages m JOIN users s ON s.id = m.sender_id LEFT JOIN users r ON r.id = m.recipient_id"
                 " LEFT JOIN attachments a ON a.message_id = m.id AND a.removed_at IS NULL"

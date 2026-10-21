@@ -252,6 +252,10 @@ class Record:
     seen_by: list = field(default_factory=list)  # who has read this (my latest message only)
     mentioned: bool = False  # this message @mentions me (or everyone)
     flash: bool = False  # briefly highlighted after jumping to it
+    sender: str = ""  # who actually wrote it (for private messages `name` is the other person)
+    ts: float = 0.0  # the server's time stamp, for searching decrypted text
+    enc: dict | None = None  # an end-to-end encrypted envelope, until it has been read
+    secure: str = ""  # "", "pending", "e2ee", "locked" or "failed": the state of an encrypted message
     att: dict | None = None  # a shared file: {id, name, mime, size, kind, sha256}
     media: dict = field(default_factory=dict)  # what the window knows about it: status, pct, photo, path...
 
@@ -588,7 +592,7 @@ class MessageList(tk.Frame):
             tk.Label(bubble, text="@ mentioned you", bg=bubble_bg, fg=p["leave"],
                      font=f.tiny).pack(anchor="w")
         if private:
-            tag = f"\U0001F512 Private to {record.name}" if record.mine else "\U0001F512 Private"
+            tag = self._private_tag(record)
             tk.Label(bubble, text=tag, bg=bubble_bg, fg=time_fg, font=f.tiny).pack(anchor="w")
         if record.reply:
             self._build_quote(bubble, record, bubble_bg, text_fg, time_fg)
@@ -663,6 +667,16 @@ class MessageList(tk.Frame):
     def _human_size(size: int) -> str:
         from storage import human_size
         return human_size(size)
+
+    @staticmethod
+    def _private_tag(record: Record) -> str:
+        to = f" to {record.name}" if record.mine else ""
+        return {
+            "e2ee": f"\U0001F512 End-to-end encrypted{to}",
+            "pending": f"\U0001F512 Encrypted{to} · opening…",
+            "locked": f"\U0001F512 Encrypted{to} · keys locked",
+            "failed": f"⚠ Encrypted{to} · could not be opened",
+        }.get(record.secure, f"\U0001F513 Private{to} · server can read this")
 
     def _build_quote(self, bubble: tk.Frame, record: Record, bubble_bg, text_fg, time_fg) -> None:
         reply = record.reply

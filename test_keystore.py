@@ -124,6 +124,20 @@ class ContactPinTest(unittest.TestCase):
         self.store.pin_contact("Bob", Identity.generate().public())
         self.assertFalse(self.store.is_verified("Bob"))
 
+    def test_old_keys_are_kept_so_earlier_messages_can_still_be_checked(self):
+        second, third = Identity.generate().public(), Identity.generate().public()
+        self.store.pin_contact("Bob", self.bob)
+        self.store.pin_contact("Bob", second)
+        self.store.pin_contact("Bob", third)
+        self.assertEqual([b.fingerprint() for b in self.store.bundles_for("bob")],
+                         [third.fingerprint(), second.fingerprint(), self.bob.fingerprint()])
+        self.store.pin_contact("Bob", third)  # re-pinning the same key adds nothing
+        self.assertEqual(len(self.store.bundles_for("Bob")), 3)
+        for _ in range(8):
+            self.store.pin_contact("Bob", Identity.generate().public())
+        self.assertLessEqual(len(self.store.bundles_for("Bob")), 1 + keystore.MAX_PREVIOUS_KEYS)
+        self.assertEqual(self.store.bundles_for("Nobody"), [])
+
     def test_unknown_contact_cannot_be_verified(self):
         self.assertFalse(self.store.mark_verified("Nobody"))
         self.assertFalse(self.store.is_verified("Nobody"))

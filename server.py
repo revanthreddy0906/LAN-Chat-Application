@@ -6,6 +6,7 @@ import argparse
 import errno
 import json
 import queue
+import e2ee
 import hashlib
 import math
 import re
@@ -793,10 +794,18 @@ class ChatServer(AdminMixin, KeysMixin):
         return True, recipient
 
     def _post_message(self, sender: Client, body: str, to_name: str | None = None,
-                      reply_to: int | None = None, attachment: dict | None = None) -> int | None:
-        """Store and deliver a message. Returns its id, or None if it was refused."""
+                      reply_to: int | None = None, attachment: dict | None = None,
+                      enc: str | None = None) -> int | None:
+        """Store and deliver a message. Returns its id, or None if it was refused.
+
+        `enc` is an end-to-end encrypted envelope (JSON text). The server stores and relays it
+        without being able to read it, so it skips everything that needs the words themselves."""
         body = body.strip()
-        if not body and attachment is None:
+        if not body and attachment is None and enc is None:
+            return None
+        if to_name is not None and enc is None and attachment is None and self.e2ee_policy == "required":
+            self._error(sender, "this server requires end-to-end encryption for private messages: "
+                                "use the chat window and unlock your keys.")
             return None
         if not can(sender.role, "send_message"):
             self._error(sender, "your role cannot send messages.")
@@ -811,7 +820,7 @@ class ChatServer(AdminMixin, KeysMixin):
 
         mention_ids: list[int] = []
         everyone = False
-        if recipient is None:
+        if recipient is None and enc is None:
             mention_ids, everyone, problem = self._parse_mentions(sender, body)
             if problem:
                 self._error(sender, problem)
@@ -820,7 +829,7 @@ class ChatServer(AdminMixin, KeysMixin):
         message_id = self.store.add_message(
             sender.user_id, body, recipient_id=recipient_id, reply_to=reply_to,
             mentions=mention_ids, mention_all=everyone,
-            kind=attachment["kind"] if attachment else "text",
+            kind=attachment["kind"] if attachment else "text", enc=enc,
         )
         if attachment is not None:
             self.store.add_attachment(
@@ -868,7 +877,37 @@ class ChatServer(AdminMixin, KeysMixin):
     def _on_ping(self, client: Client, event: dict) -> None:
         return
 
+    def _checked_envelope(self, client: Client, enc, to_name) -> str | None:
+        """The envelope as JSON text if it is acceptable, else None (the sender has been told why)."""
+        if self.e2ee_policy == "off":
+            self._error(client, "end-to-end encryption is switched off on this server.")
+            return None
+        if not isinstance(to_name, str):
+            self._error(client, "only private messages can be end-to-end encrypted for now.")
+            return None
+        recipient = self.store.get_user(to_name)
+        try:
+            people = e2ee.envelope_people(enc)
+            if recipient is None or people != sorted({client.username.lower(), recipient.username.lower()}):
+                raise e2ee.CryptoError("wrong recipients")
+            if e2ee.envelope_size(enc) > e2ee.MAX_ENVELOPE_CHARS:
+                raise e2ee.CryptoError("too large")
+        except e2ee.CryptoError:
+            self._error(client, "that encrypted message is malformed or too long.")
+            return None
+        return json.dumps(enc, separators=(",", ":"))
+
     def _on_send(self, client: Client, event: dict) -> None:
+        enc = event.get("enc")
+        if enc is not None:
+            to_name, reply_to = event.get("to"), event.get("reply_to")
+            if event.get("body") not in (None, ""):
+                self._error(client, "an encrypted message must not also carry readable text.")
+                return
+            text = self._checked_envelope(client, enc, to_name)
+            if text is not None:
+                self._post_message(client, "", to_name=to_name, reply_to=reply_to, enc=text)
+            return
         body, to_name, reply_to = event.get("body"), event.get("to"), event.get("reply_to")
         if not isinstance(body, str) or not (to_name is None or isinstance(to_name, str)):
             self._error(client, "malformed message.")
@@ -889,6 +928,9 @@ class ChatServer(AdminMixin, KeysMixin):
         if message.deleted_at is not None:
             self._error(client, "that message was deleted.")
             return
+        if message.enc is not None or event.get("enc") is not None:
+            self._edit_encrypted(client, message, event)
+            return
         body = event.get("body")
         if not isinstance(body, str) or not body.strip():
             self._error(client, "a message cannot be empty.")
@@ -901,6 +943,19 @@ class ChatServer(AdminMixin, KeysMixin):
             updated = self.store.get_message(message.id)
             self._emit({"t": "edited", "id": message.id, "body": body, "edited_at": updated.edited_at},
                        self._targets_for(updated))
+
+    def _edit_encrypted(self, client: Client, message: StoredMessage, event: dict) -> None:
+        """Replace the envelope of an encrypted message; an encrypted message never turns into plain text."""
+        if message.enc is None or event.get("enc") is None or event.get("body") not in (None, ""):
+            self._error(client, "an encrypted message can only be edited with a new encrypted version.")
+            return
+        text = self._checked_envelope(client, event["enc"], message.recipient)
+        if text is None:
+            return
+        if self.store.edit_message(message.id, client.user_id, "", enc=text):
+            updated = self.store.get_message(message.id)
+            self._emit({"t": "edited", "id": message.id, "body": "", "enc": json.loads(text),
+                        "edited_at": updated.edited_at}, self._targets_for(updated))
 
     def _on_delete(self, client: Client, event: dict) -> None:
         message = self._visible_message(client, event.get("id"))

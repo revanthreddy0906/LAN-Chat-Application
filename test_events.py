@@ -43,7 +43,7 @@ class EventsTest(unittest.TestCase):
         parent = stored(id=3, sender="Bob", body="the original question")
         event = message_event(message, parent, [("\U0001F44D", ["Bob"])], history=True)
         self.assertEqual(event["id"], 7)
-        self.assertEqual(event["reply"], {"id": 3, "sender": "Bob", "snippet": "the original question", "deleted": False})
+        self.assertEqual(event["reply"], {"id": 3, "sender": "Bob", "snippet": "the original question", "deleted": False, "encrypted": False})
         self.assertTrue(event["edited"] and event["history"] and not event["deleted"])
         self.assertEqual(event["reactions"], [{"emoji": "\U0001F44D", "users": ["Bob"]}])
 

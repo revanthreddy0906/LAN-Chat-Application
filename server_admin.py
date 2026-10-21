@@ -83,6 +83,7 @@ class AdminMixin:
             "messages": [
                 {"id": r["id"], "time": r["created_at"], "from": r["sender"], "to": r["recipient"],
                  "text": "" if r["deleted_at"] else r["body"], "deleted": bool(r["deleted_at"]),
+                 "encrypted": bool(r["enc"]), "ciphertext": json.loads(r["enc"]) if r["enc"] else None,
                  "file": r["file_name"], "reply_to": r["reply_to"]}
                 for r in rows
             ],

@@ -9,11 +9,13 @@ States: "unavailable" (no `cryptography` package), "needs_setup", "needs_restore
 
 from __future__ import annotations
 
+import re
 import tkinter as tk
 from typing import Callable
 
 import e2ee
 from e2ee import Bundle, CryptoError, Identity
+from events import snippet, snippet_around
 from keystore import KeyStore, server_id
 
 MIN_PASSPHRASE = 8
@@ -41,6 +43,10 @@ class E2EEManager:
         self._next = 1
         self._login_password = ""
         self._user = ""
+        self.bundles: dict[str, Bundle | None] = {}  # verified keys from the server; None = no keys published
+        self.seen_mids: dict[str, int] = {}  # message ids already opened this session, to spot replays
+        self.plain_ok: set[str] = set()  # people I agreed to message without encryption
+        self._decrypt_job = None
 
     # ----- plumbing
 
@@ -75,6 +81,10 @@ class E2EEManager:
         self._login_password = ""
         self._user = ""
         self.changed.clear()
+        self.bundles.clear()
+        self.seen_mids.clear()
+        self.plain_ok.clear()
+        self._decrypt_job = None
         for window in list(self.windows.values()):
             try:
                 window.destroy()
@@ -107,6 +117,7 @@ class E2EEManager:
             self.state = "ready"
             self._sync_with_server()
             app._update_header()
+            self.schedule_decrypt()
             return
         self._user = app.username.lower()
         self.store = KeyStore(app.settings.home, server_id(app.fingerprint, app.server_host, app.server_port),
@@ -136,6 +147,7 @@ class E2EEManager:
         self.identity, self.state = identity, "ready"
         self._publish(identity, backup)
         self.app._update_header()
+        self.schedule_decrypt()
         return code
 
     def _publish(self, identity: Identity, backup: dict | None = None, callback=None) -> None:
@@ -153,6 +165,7 @@ class E2EEManager:
         self.state = "ready"
         self._sync_with_server()
         self.app._update_header()
+        self.schedule_decrypt()
         return True
 
     def _sync_with_server(self) -> None:
@@ -188,6 +201,7 @@ class E2EEManager:
             self.state = "ready"
             self._sync_with_server()
             self.app._update_header()
+            self.schedule_decrypt()
             done(True, "")
         self._request({"t": "keys_backup_get"}, got)
 
@@ -249,12 +263,234 @@ class E2EEManager:
 
     def _on_key_changed(self, event: dict) -> None:
         name = event.get("user", "")
-        if self.store is not None and self.store.contact(name):
+        self.bundles.pop(name.lower(), None)  # look it up again next time
+        if self.app.private_to and self.app.private_to.lower() == name.lower():
+            self.ensure_contacts([name], self.app._update_private_chip)
+        if self.store is not None and not event.get("created") and self.store.contact(name):
             self.changed.add(name.lower())
             what = "reset their encryption keys" if event.get("reset") else "has a new security code"
             self.app.notice(f"⚠ {name} {what}. Verify it again before trusting new messages "
                             f"(right-click {name} in the member list).")
             self.app._render_users()
+
+    # ----- private messages: sending, opening, searching
+
+    def ensure_contacts(self, names: list[str], done: Callable[[], None] | None = None) -> None:
+        """Make sure I know the public keys (or the lack of them) of these people, then call `done`."""
+        me = self.app.username.lower()
+        missing = [n for n in names if n.lower() != me and n.lower() not in self.bundles]
+        if not missing or not e2ee.AVAILABLE:
+            if done:
+                done()
+            return
+
+        def got(found: dict[str, Bundle]) -> None:
+            for name, bundle in found.items():
+                self.bundles[name.lower()] = bundle
+            for name in missing:
+                self.bundles.setdefault(name.lower(), None)
+            if done:
+                done()
+        self.lookup(missing, got)
+
+    def private_label(self, name: str) -> str:
+        """The text of the chip above the message box for a private conversation."""
+        if not e2ee.AVAILABLE or self.policy == "off":
+            return f"\U0001F513 Private to {name} · not end-to-end encrypted"
+        if self.state != "ready":
+            return f"\U0001F513 Private to {name} · your keys are not unlocked"
+        if name.lower() not in self.bundles:
+            return f"\U0001F512 Private to {name}"
+        bundle = self.bundles[name.lower()]
+        if bundle is None:
+            return f"\U0001F513 Private to {name} · {name} has no encryption keys yet"
+        if self.contact_status(name, bundle) == "changed":
+            return f"⚠ Private to {name} · their security code changed"
+        return f"\U0001F512 End-to-end encrypted with {name}" + (" ✔" if self.store.is_verified(name) else "")
+
+    def send_private(self, text: str, to: str, reply_id: int | None, done: Callable[[dict | None], None]) -> None:
+        """Turn a private message into the event to send: encrypted when possible, plain only if allowed.
+
+        `done(event)` gets the event, or None when the message was refused (the reason is shown)."""
+        app = self.app
+        extra = {"reply_to": reply_id} if reply_id else {}
+
+        def plain() -> None:
+            done({"t": "send", "to": to, "body": text, **extra})
+
+        def refuse(reason: str) -> None:
+            app.notice(reason)
+            done(None)
+
+        if not e2ee.AVAILABLE or self.policy == "off":
+            plain()
+            return
+        if self.state != "ready":
+            if self.policy == "required":
+                refuse("This server requires end-to-end encryption for private messages. "
+                       "Set up or unlock your keys first (⋯ → Encryption keys…).")
+            else:
+                plain()
+            return
+        size = len(text.encode("utf-8"))
+        if size > e2ee.MAX_TEXT_BYTES:
+            refuse(f"Encrypted messages can be up to {e2ee.MAX_TEXT_BYTES} bytes; this one is {size}. Please shorten it.")
+            return
+
+        def go() -> None:
+            bundle = self.bundles.get(to.lower())
+            if bundle is None:
+                if self.policy == "required":
+                    refuse(f"{to} has not set up encryption yet, and this server requires it for private messages.")
+                    return
+                if to.lower() not in self.plain_ok:
+                    if not app.confirm(f"{to} has no encryption keys",
+                                       f"{to} has not set up end-to-end encryption, so this message could be read by "
+                                       "the server (it is still protected on the network by TLS). Send it anyway?"):
+                        done(None)
+                        return
+                    self.plain_ok.add(to.lower())
+                plain()
+                return
+            status = self.contact_status(to, bundle)
+            if status == "changed":
+                self.changed.add(to.lower())
+                app._render_users()
+                refuse(f"⚠ {to}'s security code changed, so this message was not sent. Check it with them, then accept "
+                       f"the new code (right-click {to} → Verify security code).")
+                app.root.after_idle(lambda: self.open_verify(to))
+                return
+            if status == "new":
+                self.store.pin_contact(to, bundle)
+                app.notice(f"Messages with {to} are now end-to-end encrypted. To be sure it really is {to}, compare "
+                           "security codes (right-click their name → Verify security code).", tone="system")
+            envelope = e2ee.encrypt_message(e2ee.encode_payload(text), self.identity, app.username, {to: bundle})
+            done({"t": "send", "to": to, "enc": envelope, **extra})
+            app._update_private_chip()
+
+        self.ensure_contacts([to], go)
+
+    def edit_event(self, record, text: str) -> dict | None:
+        """The edit event for one of my encrypted messages (a new envelope), or None if it cannot be made."""
+        app = self.app
+        size = len(text.encode("utf-8"))
+        known = self.store.contact(record.name) if self.store else None
+        if self.identity is None or known is None:
+            app.notice("Unlock your encryption keys to edit this message.")
+            return None
+        bundle = Bundle.from_dict(known["bundle"])
+        fresh = self.bundles.get(record.name.lower())
+        if fresh is not None and fresh.fingerprint() != bundle.fingerprint():
+            app.notice(f"⚠ {record.name}'s security code changed; verify it before editing this message.")
+            return None
+        if size > e2ee.MAX_TEXT_BYTES:
+            app.notice(f"Encrypted messages can be up to {e2ee.MAX_TEXT_BYTES} bytes; this one is {size}.")
+            return None
+        envelope = e2ee.encrypt_message(e2ee.encode_payload(text), self.identity, app.username, {record.name: bundle})
+        return {"t": "edit", "id": record.id, "enc": envelope}
+
+    def schedule_decrypt(self) -> None:
+        if self._decrypt_job is None:
+            self._decrypt_job = self.app.root.after_idle(self._run_decrypt)
+
+    def _undecrypted(self) -> list:
+        return [r for r in self.app.messages.records if r.enc and r.secure in ("pending", "locked")]
+
+    def _run_decrypt(self) -> None:
+        self._decrypt_job = None
+        pending = self._undecrypted()
+        if not pending:
+            self._fix_replies()
+            return
+        if self.identity is None or not e2ee.AVAILABLE:
+            for record in pending:
+                if record.secure != "locked":
+                    record.secure = "locked"
+                    record.text = "\U0001F512 Encrypted message. Unlock your keys (⋯ → Encryption keys…) to read it."
+                    self.app.messages.refresh(record)
+            return
+        names = {r.sender for r in pending}
+        self.ensure_contacts(sorted(names), lambda: self._decrypt(pending))
+
+    def _sender_bundles(self, name: str) -> list[Bundle]:
+        """The keys to check a sender against: my own, those I pinned (newest first), or at first sight the server's."""
+        if name.lower() == self.app.username.lower():
+            return [self.identity.public()]
+        fresh = self.bundles.get(name.lower())
+        pinned_all = self.store.bundles_for(name)
+        if pinned_all:
+            pinned = pinned_all[0]
+            if fresh is not None and fresh.fingerprint() != pinned.fingerprint() and name.lower() not in self.changed:
+                self.changed.add(name.lower())
+                self.app.notice(f"⚠ {name} has a new security code. Their messages are checked against the old one "
+                                "until you verify the new one (right-click their name).")
+                self.app._render_users()
+            return pinned_all  # never trust the server's newer key for messages that claim to be from before
+        if fresh is not None:
+            self.store.pin_contact(name, fresh)
+            return [fresh]
+        return []
+
+    def _decrypt(self, pending: list) -> None:
+        app = self.app
+        for record in pending:
+            if record.secure not in ("pending", "locked") or not record.enc or self.identity is None:
+                continue
+
+            def fail(reason: str, record=record) -> None:
+                record.secure = "failed"
+                record.text = f"⚠ Could not open this message: {reason}."
+                app.messages.refresh(record)
+
+            candidates = self._sender_bundles(record.sender)
+            if not candidates:
+                fail(f"{record.sender} has no encryption keys on the server")
+                continue
+            payload, last_error = None, ""
+            for bundle in candidates:
+                try:
+                    payload = e2ee.decode_payload(e2ee.decrypt_message(
+                        record.enc, self.identity, app.username, record.sender, bundle))
+                    break
+                except CryptoError as error:
+                    last_error = str(error)
+            if payload is None:
+                fail(last_error)
+                continue
+            earlier = self.seen_mids.get(payload["mid"])
+            if earlier is not None and earlier != record.id:
+                fail("it is a copy of an earlier message (possible replay)")
+                continue
+            self.seen_mids[payload["mid"]] = record.id
+            record.text, record.secure = payload["b"], "e2ee"
+            app.messages.refresh(record)
+        self._fix_replies()
+
+    def _fix_replies(self) -> None:
+        """Quote encrypted messages in replies, now that this window can read them."""
+        messages = self.app.messages
+        for record in messages.records:
+            reply = record.reply
+            if not reply or not reply.get("encrypted"):
+                continue
+            parent = messages.record_for(reply["id"])
+            if parent is not None and parent.secure == "e2ee" and reply.get("snippet") != snippet(parent.text):
+                record.reply = {**reply, "snippet": snippet(parent.text)}
+                messages.refresh(record)
+
+    def search_local(self, query: str) -> list[dict]:
+        """Matches among decrypted messages on screen (the server cannot search what it cannot read)."""
+        terms = re.findall(r"\w+", query.lower())[:8]
+        if not terms:
+            return []
+        me = self.app.username
+        found = []
+        for record in self.app.messages.records:
+            if record.secure == "e2ee" and record.id and all(term in record.text.lower() for term in terms):
+                found.append({"id": record.id, "sender": record.sender, "ts": record.ts,
+                               "to": record.name if record.mine else me,
+                               "snippet": snippet_around(record.text, terms)})
+        return found
 
     # ----- dialogs
 

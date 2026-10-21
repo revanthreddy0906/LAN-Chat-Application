@@ -13,8 +13,10 @@ from __future__ import annotations
 import base64
 import hashlib
 import hmac
+import json
 import os
 import secrets
+import time
 from dataclasses import dataclass
 
 try:
@@ -272,6 +274,94 @@ def _message_key(dh_ephemeral: bytes, dh_static: bytes, epk: bytes, sender_dh: b
 
 def _envelope_message(epk: bytes, nonce: bytes, ciphertext: bytes, aad: bytes) -> bytes:
     return b"lanchat-envelope-v1" + epk + nonce + ciphertext + aad
+
+
+# ----- messages for one or more people (what the chat actually sends) -----
+
+MAX_TEXT_BYTES = 1500  # longest message text that still fits one frame with its keys and signatures
+MAX_ENVELOPE_CHARS = 3000  # what the server will accept for one encrypted message
+
+
+def message_aad(kind: str, sender: str, names) -> bytes:
+    """Who the message is from and who it is for, bound into every ciphertext and signature."""
+    return f"lanchat-msg-v2|{kind}|{sender.lower()}|{','.join(sorted(n.lower() for n in names))}".encode()
+
+
+def encode_payload(body: str) -> bytes:
+    """The plaintext that gets encrypted: the text, a random id (to spot replays) and the time."""
+    return json.dumps({"b": body, "mid": secrets.token_hex(8), "ts": time.time()}, ensure_ascii=False,
+                      separators=(",", ":")).encode("utf-8")
+
+
+def decode_payload(data: bytes) -> dict:
+    try:
+        payload = json.loads(data.decode("utf-8"))
+        if not isinstance(payload, dict) or not isinstance(payload.get("b"), str) or not isinstance(payload.get("mid"), str):
+            raise ValueError
+    except (ValueError, UnicodeError) as error:
+        raise CryptoError("the decrypted message is malformed") from error
+    return payload
+
+
+def encrypt_message(plaintext: bytes, me: Identity, my_name: str, recipients: dict[str, Bundle],
+                    kind: str = "text") -> dict:
+    """Encrypt once with a random message key, then seal that key separately for each person.
+
+    `recipients` is {name: public bundle} and should include the sender, so the sender can read
+    their own history on another day. The text is encrypted a single time, so adding people
+    costs a few hundred bytes each, not a copy of the message.
+    """
+    require()
+    people = {name.lower(): bundle for name, bundle in recipients.items()}
+    people[my_name.lower()] = me.public()
+    aad = message_aad(kind, my_name, people)
+    key, nonce = os.urandom(32), os.urandom(12)
+    ciphertext = ChaCha20Poly1305(key).encrypt(nonce, plaintext, aad)
+    sealed = {name: seal(key, me, bundle.dh, aad + b"|key|" + name.encode()) for name, bundle in sorted(people.items())}
+    signature = me.sign.sign(b"lanchat-msg-v2" + nonce + ciphertext + aad)
+    return {"v": 2, "n": b64(nonce), "ct": b64(ciphertext), "k": sealed, "sig": b64(signature)}
+
+
+def envelope_size(envelope: dict) -> int:
+    return len(json.dumps(envelope, separators=(",", ":")))
+
+
+def envelope_people(envelope) -> list[str]:
+    """The names an envelope is addressed to (lower case), or raises if it is malformed."""
+    try:
+        keys = envelope["k"]
+        if envelope.get("v") != 2 or not isinstance(keys, dict) or not keys or not all(
+                isinstance(name, str) and isinstance(entry, dict) for name, entry in keys.items()):
+            raise CryptoError("malformed encrypted message")
+        for field in ("n", "ct", "sig"):
+            if not isinstance(envelope[field], str):
+                raise CryptoError("malformed encrypted message")
+        return sorted(keys)
+    except (KeyError, TypeError, AttributeError) as error:
+        raise CryptoError("malformed encrypted message") from error
+
+
+def decrypt_message(envelope: dict, me: Identity, my_name: str, sender_name: str, sender: Bundle,
+                    kind: str = "text") -> bytes:
+    """Open a message addressed to me. Raises CryptoError unless it is exactly what `sender` sent."""
+    require()
+    names = envelope_people(envelope)
+    aad = message_aad(kind, sender_name, names)
+    nonce, ciphertext, signature = unb64(envelope["n"]), unb64(envelope["ct"]), unb64(envelope["sig"])
+    try:
+        Ed25519PublicKey.from_public_bytes(sender.sign).verify(signature, b"lanchat-msg-v2" + nonce + ciphertext + aad)
+    except InvalidSignature as error:
+        raise CryptoError("the message is not signed by the person it claims to be from") from error
+    except ValueError as error:
+        raise CryptoError("the sender's key is not valid") from error
+    mine = envelope["k"].get(my_name.lower())
+    if mine is None:
+        raise CryptoError("this message was not encrypted for you")
+    key = open_sealed(mine, me, sender, aad + b"|key|" + my_name.lower().encode())
+    try:
+        return ChaCha20Poly1305(key).decrypt(nonce, ciphertext, aad)
+    except InvalidTag as error:
+        raise CryptoError("the message was altered") from error
 
 
 def constant_time_equal(a: str, b: str) -> bool:
