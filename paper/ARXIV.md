@@ -1,12 +1,12 @@
 # Preparing this paper for arXiv
 
-Files: `survey_paper.tex` (single file: figures are TikZ, the bibliography is inline, no external files), `survey_paper.pdf` (compiled), `survey_paper_original.*` (the first version) and `survey_paper_survey_version.*` (the survey-framed version, kept in case a journal or conference accepts it first). Compile check: `tectonic survey_paper.tex` (or `pdflatex` twice).
+**Upload only `survey_paper.tex`** (arXiv rejects a PDF that TeX produced). Files: `survey_paper.tex` (single file: figures are TikZ, the bibliography is inline, no external files), `survey_paper.pdf` (compiled), `survey_paper_original.*` (the first version) and `survey_paper_survey_version.*` (the survey-framed version, kept in case a journal or conference accepts it first). Compile check: `tectonic survey_paper.tex` (or `pdflatex` twice).
 
 ## Metadata to paste into the arXiv form
 
 - **Title:** LANChat-H: Design, Implementation and Evaluation of a Dependency-Light Secure LAN Chat System with End-to-End Encryption
 - **Authors:** Harish Goud B; Revanth Reddy Lingala; Saarthak Manocha
-- **Primary category:** cs.NI (Networking and Internet Architecture). **Cross-lists:** cs.CR (Cryptography and Security), cs.DC (Distributed, Parallel, and Cluster Computing)
+- **Primary category:** cs.CR (Cryptography and Security). **Cross-lists:** cs.NI (Networking and Internet Architecture), cs.DC (Distributed, Parallel, and Cluster Computing)
 - **Comments:** 9 pages, 9 tables, 2 figures, 1 listing. Code and benchmark scripts: https://github.com/revanthreddy0906/LAN-Chat-Application
 - **License:** your choice at submission; CC BY 4.0 is the usual one for papers.
 - **Abstract:** copy the text of the abstract in the .tex (remove the LaTeX; there is no maths in it).
