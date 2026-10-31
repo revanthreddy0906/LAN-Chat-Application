@@ -69,15 +69,16 @@ def trial(megabytes, tls):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--sizes", type=int, nargs="+", default=[1, 5, 20])
-    parser.add_argument("--runs", type=int, default=3)
+    parser.add_argument("--runs", type=int, default=7)
     args = parser.parse_args()
     print(f"# python {sys.version.split()[0]}, loopback; MB/s includes hashing, the ticket exchange and verification")
     print("size_MB  TLS    upload_MBps  download_MBps")
     for size in args.sizes:
         for tls in (False, True):
             runs = [trial(size, tls) for _ in range(args.runs)]
-            print(f"{size:>7}  {str(tls):<5} {statistics.median(r[0] for r in runs):>11.1f}  "
-                  f"{statistics.median(r[1] for r in runs):>13.1f}", flush=True)
+            up, down = [r[0] for r in runs], [r[1] for r in runs]
+            print(f"{size:>7}  {str(tls):<5} {statistics.median(up):>7.0f} [{min(up):.0f}-{max(up):.0f}]  "
+                  f"{statistics.median(down):>7.0f} [{min(down):.0f}-{max(down):.0f}]", flush=True)
 
 
 if __name__ == "__main__":

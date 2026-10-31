@@ -20,6 +20,7 @@ import time
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 os.environ.setdefault("LANCHAT_HOME", tempfile.mkdtemp())
 
 from accounts import AccountStore  # noqa: E402
@@ -88,6 +89,10 @@ def run_trial(kind, fast, messages, size, interval, stalled):
     tmp = tempfile.mkdtemp()
     if kind == "relay":
         server = SequentialRelay()
+        port = server.port
+    elif kind in ("asyncio", "asyncio-db"):
+        from baselines import AsyncioRelay
+        server = AsyncioRelay(persist=(kind == "asyncio-db"))
         port = server.port
     else:
         accounts = AccountStore(os.path.join(tmp, "b.db"))
@@ -182,7 +187,8 @@ def main():
     print(f"# python {sys.version.split()[0]}, {args.fast} fast receivers, {args.messages} messages of "
           f"{args.size} bytes every {args.interval}s")
     print("server              stalled  sent  delivered/expected   median_ms   p95_ms")
-    for kind, label in (("relay", "sequential relay"), ("chat", "LANChat-H outbox")):
+    for kind, label in (("relay", "sequential relay"), ("asyncio", "asyncio relay"), ("asyncio-db", "asyncio + SQLite"),
+                        ("chat", "LANChat-H outbox")):
         for stalled in (False, True):
             r = run_trial(kind, args.fast, args.messages, args.size, args.interval, stalled)
             print(f"{label:<19} {str(stalled):<8} {r['sent']:>4}  {r['delivered']:>8}/{r['expected']:<8}  "

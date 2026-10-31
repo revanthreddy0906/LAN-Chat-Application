@@ -278,5 +278,17 @@ class HistoryPagingTest(V3TestCase):
         self.assertLessEqual(MAX_BODY_BYTES, 3400)
 
 
+class MalformedRequestTest(V3TestCase):
+    """Found by the fuzzer (security_tests/fuzz.py): numbers too big for SQLite used to kill the connection thread."""
+
+    def test_oversized_numbers_are_refused_and_the_connection_survives(self):
+        alice = self.v2("Alice")
+        for event in ({"t": "react", "id": 2 ** 70, "emoji": "+1"}, {"t": "edit", "id": -2 ** 80, "body": "x"},
+                      {"t": "pin", "id": 2 ** 64, "on": True}, {"t": "history", "before": 2 ** 99, "limit": 5}):
+            alice.send(**event)
+            self.assertIn("malformed", self.error_of(alice))
+        self.assertEqual(alice.say("still connected")["body"], "still connected")
+
+
 if __name__ == "__main__":
     unittest.main()

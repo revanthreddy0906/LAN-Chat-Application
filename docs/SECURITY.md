@@ -57,3 +57,8 @@ This page is the threat model and the list of controls. The end-to-end encryptio
 - **Lockout is per address and name.** It slows guessing; it does not stop a determined attacker with many addresses, and a locked-out real user must wait.
 - **The window is not a vault.** Decrypted text lives in memory while the window is open; the lock hides it and drops the keys but a computer that is already compromised is out of scope.
 - Built for a trusted LAN of tens of people, not the public internet. There is no password-reset email; an admin resets passwords.
+
+
+## Our own robustness testing
+
+`python3 security_tests/fuzz.py --seed N` sends hostile connections, events and transfer tickets to a live server and checks that no server thread raises and that a fresh client still works; `python3 security_tests/tls_probe.py` checks the TLS versions and pinning behaviour. These are our own tests, not an independent audit. The fuzzer found one bug (integers above 2^63 reached SQLite and ended the sender's connection thread); the server now refuses such a request with "that request was malformed" and keeps the connection (`test_v3.MalformedRequestTest`).

@@ -29,3 +29,5 @@ paper/.claude/
 
 # Screenshot showcase data
 demo/showcase/
+bench/results/*.log
+bench/results/*.err

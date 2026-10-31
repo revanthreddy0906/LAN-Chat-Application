@@ -8,6 +8,7 @@ monotonic clock.
 """
 import argparse
 import json
+import resource
 import math
 import os
 import statistics
@@ -18,6 +19,7 @@ import time
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 os.environ.setdefault("LANCHAT_HOME", tempfile.mkdtemp())
 
 from accounts import AccountStore  # noqa: E402
@@ -34,16 +36,24 @@ def percentile(values, q):
     return values[index]
 
 
-def run(clients, messages, interval, size, tls, per_process=20):
+def run(clients, messages, interval, size, tls, per_process=20, kind="chat"):
     tmp = tempfile.mkdtemp()
-    accounts = AccountStore(os.path.join(tmp, "bench.db"))
-    for name in ["sender"] + [f"r{i}" for i in range(clients)]:
-        accounts.create_account(name, "bench-password")
-    context = default_tls_context()[0] if tls else None
-    server = ChatServer("127.0.0.1", 0, accounts=accounts, tls_context=context, quiet=True,
-                        rate_limit=None, connection_limit=None, enforce_password_policy=False)
-    server.start()
-    port = server.bound_port
+    if kind == "chat":
+        accounts = AccountStore(os.path.join(tmp, "bench.db"))
+        for name in ["sender"] + [f"r{i}" for i in range(clients)]:
+            accounts.create_account(name, "bench-password")
+        context = default_tls_context()[0] if tls else None
+        server = ChatServer("127.0.0.1", 0, accounts=accounts, tls_context=context, quiet=True,
+                            rate_limit=None, connection_limit=None, enforce_password_policy=False)
+        server.start()
+        port = server.bound_port
+    else:
+        from baselines import AsyncioRelay
+        from slow_receiver import SequentialRelay
+        server = {"relay": SequentialRelay, "asyncio": AsyncioRelay,
+                  "asyncio-db": lambda: AsyncioRelay(persist=True)}[kind]()
+        port = server.port
+    cpu_start = time.process_time()
     duration = messages * interval + 4
     procs = []
     flags = ["--tls"] if tls else []
@@ -71,9 +81,11 @@ def run(clients, messages, interval, size, tls, per_process=20):
         received += data["received_per_client"]
         proc.wait(10)
     sender.wait(10)
+    cpu_s = time.process_time() - cpu_start
     server.stop()
+    rss_mb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / (1024 * 1024 if sys.platform == "darwin" else 1024)
     expected = clients * messages
-    return {
+    return {"kind": kind, "cpu_s": cpu_s, "rss_mb": rss_mb,
         "clients": clients, "tls": tls, "messages": messages, "delivered": len(latencies), "expected": expected,
         "median_ms": statistics.median(latencies), "p95_ms": percentile(latencies, 0.95),
         "max_ms": max(latencies), "mean_ms": statistics.fmean(latencies),
@@ -87,12 +99,17 @@ def main():
     parser.add_argument("--interval", type=float, default=0.1)
     parser.add_argument("--size", type=int, default=100)
     parser.add_argument("--tls", action="store_true")
+    parser.add_argument("--kind", default="chat", choices=["chat", "relay", "asyncio", "asyncio-db"])
+    parser.add_argument("--json", action="store_true", help="print one JSON line per client count")
     args = parser.parse_args()
     print(f"# python {sys.version.split()[0]}, platform {sys.platform}, tls={args.tls}, "
           f"{args.messages} messages of about {args.size} bytes every {args.interval}s")
     print("clients  delivered/expected  median_ms  p95_ms   max_ms")
     for count in args.clients:
-        r = run(count, args.messages, args.interval, args.size, args.tls)
+        r = run(count, args.messages, args.interval, args.size, args.tls, kind=args.kind)
+        if args.json:
+            print(json.dumps(r), flush=True)
+            continue
         print(f"{r['clients']:>7}  {r['delivered']:>9}/{r['expected']:<9}  {r['median_ms']:>9.2f}  {r['p95_ms']:>6.2f}  {r['max_ms']:>7.2f}",
               flush=True)
 

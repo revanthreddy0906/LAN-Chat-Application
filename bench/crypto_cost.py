@@ -15,19 +15,35 @@ import e2ee  # noqa: E402
 from accounts import AccountStore  # noqa: E402
 
 
-def timed(function, runs=15):
+class Result(float):
+    """The median, with the spread kept alongside it."""
+    def __new__(cls, median, sd, low, high):
+        obj = super().__new__(cls, median)
+        obj.sd, obj.low, obj.high = sd, low, high
+        return obj
+
+
+SPREAD = []
+
+
+def timed(function, runs=30):
     samples = []
     for _ in range(runs):
         started = time.perf_counter()
         function()
         samples.append((time.perf_counter() - started) * 1000)
-    return statistics.median(samples)
+    result = Result(statistics.median(samples), statistics.stdev(samples) if len(samples) > 1 else 0.0, min(samples), max(samples))
+    SPREAD.append(result)
+    return result
 
 
 def main():
+    import atexit
+    atexit.register(lambda: print("\n# median ± sd [min–max] in ms, per line above:\n" + "\n".join(
+        f"{i + 1:>2}  {r:.3f} ± {r.sd:.3f} [{r.low:.3f}–{r.high:.3f}]" for i, r in enumerate(SPREAD))))
     accounts = AccountStore(os.path.join(tempfile.mkdtemp(), "c.db"))
     accounts.create_account("alice", "correct horse")
-    print(f"# python {sys.version.split()[0]}, median of 15 runs")
+    print(f"# python {sys.version.split()[0]}, median of 30 runs")
     print(f"password check (scrypt n=2^14, r=8, p=1)      {timed(lambda: accounts.authenticate('alice', 'correct horse')):8.1f} ms")
     if not e2ee.AVAILABLE:
         print("end-to-end primitives: the cryptography package is not installed")

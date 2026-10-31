@@ -276,8 +276,10 @@ class KeysTest(RoomCase):
         self.alice.next += 1
         self.alice.distribute()  # dave shows up in alice's missing list; she hands him her chain as it stands
         self.alice.say("after dave")
+        # the live message can reach dave before or after his key fetch, depending on thread timing; collect both
+        events = [e for e in dave.peer.drain(0.5) if e["t"] == "message"]
         dave.fetch()
-        events = [e for e in dave.peer.drain(0.6) if e["t"] == "message"]
+        events += [e for e in dave.peer.drain(0.3) if e["t"] == "message"]
         self.assertEqual(dave.read(events[-1]), "after dave")
         self.assertEqual(len(events), 1)
         history = [m for m in self.v2("Erin").history if m.get("enc") and m["sender"] == "Alice"]

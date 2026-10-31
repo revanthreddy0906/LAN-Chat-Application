@@ -57,7 +57,7 @@ harishgoudbit@cbit.ac.in & revanthreddy0906@gmail.com & saarthakmanocha10@gmail.
 \maketitle
 
 \begin{abstract}
-Small teams and classrooms often want a private chat that stays on their own network, but the usual options are either heavy (federated protocols, brokers, web stacks) or simple demonstrations with no persistence, identity or protection from the network or from whoever runs the server. We present LANChat-H, a LAN chat system whose core uses only the Python standard library. It combines length-prefixed TCP framing with a plain-text fallback for older clients, a bounded outbound queue per client that isolates slow receivers, TLS with trust-on-first-use pinning, memory-hard credentials with lockout and rate limits, server-checked roles, SQLite persistence, ticketed file transfer and a hash-chained audit log. On top, end-to-end encryption (X25519, Ed25519, ChaCha20-Poly1305) covers private messages, files and an optional group room, so the server stores only ciphertext; the room uses one-way key chains per sender and epoch, so late joiners read only what follows and removed members never receive new keys. On one laptop over loopback, median delivery latency stayed between 2.7 and 5.8 ms for up to 100 receivers; when one receiver stopped reading, a sequential-relay baseline stopped delivering to everyone after about 232 messages while LANChat-H delivered all 6000 of 6000; encrypting a message costs about 0.3 ms and a 20 MB file about 31 ms; and a test that scans every frame the server handles, with its database and stored files, finds none of the secrets of encrypted conversations. About 10,600 lines are covered by 452 tests and 370 scripted checks. Limits: no forward secrecy, metadata visible to the server, one machine, no asynchronous baseline.
+Small teams and classrooms often want a private chat that stays on their own network, but the usual options are either heavy (federated protocols, brokers, web stacks) or simple demonstrations with no persistence, identity or protection from the network or from whoever runs the server. We present LANChat-H, a LAN chat system whose core uses only the Python standard library. It combines length-prefixed TCP framing with a plain-text fallback for older clients, a bounded outbound queue per client that isolates slow receivers, TLS with trust-on-first-use pinning, memory-hard credentials with lockout and rate limits, server-checked roles, SQLite persistence, ticketed file transfer and a hash-chained audit log. On top, end-to-end encryption (X25519, Ed25519, ChaCha20-Poly1305) covers private messages, files and an optional group room, so the server stores only ciphertext; the room uses one-way key chains per sender and epoch. We state the limits up front: there is no forward secrecy, the server still sees metadata, and trust is only as good as the comparison of security codes. On one laptop, repeated trials over loopback gave a median delivery latency for 100 receivers of 1.6 ms for a sequential relay, 2.3 ms for an \code{asyncio} relay and 6.9 ms for LANChat-H, which does more work per message; when one receiver stopped reading, a sequential relay delivered 2320 of about 5400 messages in every trial, while LANChat-H, like the \code{asyncio} relays, delivered all 6000; a 40-client mixed workload with file uploads over TLS, passed through an emulated network path, added about 7 ms on top of the path delay; and one core of the server host is saturated at about 200 receivers. Our own robustness testing (about 160{,}000 hostile events, a TLS probe and a static scan) found and fixed one real bug; it is not an independent audit. About 10{,}600 lines are covered by 453 tests and 370 scripted checks.
 \end{abstract}
 
 \begin{IEEEkeywords}
@@ -71,13 +71,14 @@ Small teams, classrooms and labs often want somewhere to talk and share files th
 
 Filling that gap exposes four problems that look separate but interact. First, TCP offers a byte stream, so a chat protocol must define its own message boundaries \cite{rfc9293,stevens}, and that definition has to survive new features and older clients. Second, a server with many long-lived connections must not let one slow or stalled client delay the others, a head-of-line problem that sequential broadcast has by construction. Third, a local network is not a trust boundary: any host can connect, sniff and impersonate, so the system needs transport security, identity, throttling and an audit trail. Fourth, the person who runs the server should not automatically be able to read private conversations, which calls for end-to-end encryption in a system whose server also relays, stores, searches and moderates messages.
 
-This paper presents LANChat-H, a chat system for local networks that addresses all four in one small code base whose core uses only the Python standard library \cite{pysocket,pythreading}. It began as a minimal threaded relay and grew through a sequence of milestones, each leaving earlier behaviour and the terminal client working (Section~\ref{sec:path}). The contributions are:
+This paper presents LANChat-H, a chat system for local networks that addresses all four in one small code base whose core uses only the Python standard library \cite{pysocket,pythreading}. It began as a minimal threaded relay and grew through a sequence of milestones, each leaving earlier behaviour and the terminal client working (Section~\ref{sec:path}). What is new is the combination and its measured evaluation, not a new cipher or protocol (Section~\ref{sec:novelty}). The contributions are:
 \begin{enumerate}
   \item a protocol and server design that keeps framing simple and compatible: length-prefixed frames carrying plain text or versioned JSON events, a renderer that lets text-only clients keep working as features are added, and a bounded outbound queue with a writer thread per client that isolates slow receivers;
   \item a layered security design for a trusted-network deployment: TLS with trust-on-first-use pinning, memory-hard credentials with lockout and rate limits, roles checked on the server, ticket-authorised file transfer with hash verification, and a hash-chained audit log;
   \item an end-to-end encryption layer for a server that also stores and relays: private messages and files, and an optional group room built on one-way per-sender key chains per epoch (late joiners read only what follows, removed members never receive the new keys), with key rotation, recovery and an app lock, all from audited primitives;
-  \item an implementation of about 10,600 lines with one optional third-party package, covered by 452 automated tests and 370 scripted checks of the real window, including a test that scans every frame the server handles for the secrets of encrypted conversations; and
-  \item a measured evaluation on one machine, with the limits of the design and of the measurements stated.
+  \item an implementation of about 10,600 lines with one optional third-party package, covered by 453 automated tests and 370 scripted checks of the real window, including a test that scans every frame the server handles for the secrets of encrypted conversations;
+  \item a measured evaluation with repeated trials, variability, CPU and memory figures, comparison with sequential and \code{asyncio} relays, a mixed workload through an emulated network path, and our own robustness testing; and
+  \item an explicit statement of what the design does not protect: no forward secrecy, visible metadata, trust on first use, and measurements from a single machine.
 \end{enumerate}
 Section~\ref{sec:related} places the work among related systems. Section~\ref{sec:goals} states the goals and the threat model. Section~\ref{sec:design} describes the design, and Section~\ref{sec:impl} the implementation. Section~\ref{sec:eval} evaluates it, Section~\ref{sec:discussion} discusses lessons and limits, and Section~\ref{sec:conclusion} concludes.
 
@@ -118,6 +119,27 @@ Reliable groups \cite{birman87,birman93} & Reliable channels & N/A & Process gro
 \end{table*}
 Each of these works treats one concern well. What is missing is a small artifact in which framing, isolation of slow clients, trust, persistence and end-to-end encryption can be read, tested and measured together. That is the niche LANChat-H occupies. It is a systems contribution, not a new protocol or cipher: the novelty is in how the pieces are combined and checked.
 
+\subsection{What Is New Here}\label{sec:novelty}
+Established secure messengers solve end-to-end encryption better than LANChat-H does: Signal's Double Ratchet gives forward secrecy and post-compromise security \cite{signal,cohngordon}, Matrix and OMEMO bring the same ideas to federated and XMPP deployments \cite{matrix,omemo}, and MLS scales groups \cite{rfc9420}. LANChat-H does not compete with them on cryptographic strength. Table~\ref{tab:novelty} states the difference in what is offered. The contribution is a design point those systems do not occupy: a LAN-first system in one small readable code base, started with one command and no external services, in which the host is explicitly not trusted for private content, in which an administrator can still operate it (roles, audit log, backups, re-keying) and in which slow clients cannot stall the room, with each of these properties tested and measured in one place. Where the design is weaker (no ratchet, no multi-device, metadata visible) we say so in Section~\ref{sec:discussion}.
+
+\begin{table}[t]
+\centering
+\caption{Qualitative Comparison with Established Secure Messaging Designs (from their published designs, not from measurements of those products)}
+\label{tab:novelty}
+\scriptsize
+\begin{tabularx}{\columnwidth}{@{}>{\raggedright\arraybackslash}p{1.45cm} Y Y Y@{}}
+\toprule
+ & \textbf{Forward secrecy} & \textbf{Deployment} & \textbf{Group model} \\
+\midrule
+Signal \cite{signal} & Yes (ratchet) & Central service, internet and phone number & Sender keys, server-assisted \\
+Matrix \cite{matrix} & Yes (ratchet, Megolm sessions) & Federated; self-hosting is a separate server and database & Per-room sessions \\
+XMPP + OMEMO \cite{omemo} & Yes (ratchet) & XMPP server plus clients that implement the extension & Per-room device keys \\
+IRC over TLS \cite{rfc1459} & None end to end & One server, no content protection from it & Server relays plaintext \\
+\textbf{LANChat-H} & \textbf{No} (stated limit) & \textbf{One folder, one command; the host is untrusted for private chats; audit log, roles} & \textbf{Per-sender chain per epoch; removal re-keys} \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
 %======================================================================
 \section{Design Goals and Threat Model}\label{sec:goals}
 %======================================================================
@@ -132,7 +154,9 @@ Each of these works treats one concern well. What is missing is a small artifact
   \item[G7] \emph{Verifiable.} Every claim above is backed by a test or a measurement that can be rerun.
 \end{enumerate}
 
-\textbf{Threat model.} Table~\ref{tab:threat} lists whom we defend against. We assume the clients' computers are not compromised and that the person comparing security codes is who they say they are. We do not try to hide metadata, to defend a compromised endpoint, or to scale beyond tens of people.
+\textbf{Assets.} (i) The content of private messages, private files and, when enabled, the group room; (ii) the long-term identity keys and the passphrase and recovery code that protect them; (iii) accounts and their roles; (iv) the integrity of the history and of the audit log; (v) the availability of the room for everyone else.
+
+\textbf{Adversaries and assumptions.} Table~\ref{tab:threat} lists whom we defend against. We assume the clients' computers are not compromised while a window is unlocked, that cryptographic primitives and the operating system's random generator are sound, and that the people who compare security codes do so over a channel the server does not control. We do not try to hide metadata, to defend a compromised endpoint, to resist a global network observer, or to scale beyond tens of people.
 
 \begin{table}[t]
 \centering
@@ -145,9 +169,32 @@ Each of these works treats one concern well. What is missing is a small artifact
 \midrule
 Another host on the network & Defended: TLS, certificate pinning, lockout, rate limits \\
 A member beyond their role & Defended: roles checked on the server; hostile files and names neutralised; replays and forged senders detected \\
+A malformed or hostile client & Defended: size-limited frames, validated events, one bad request refused without dropping others (Section~\ref{sec:eval}) \\
 The host or a thief of its disk & Partly: private messages, private files and the optional room are ciphertext; metadata and anything sent unencrypted are not \\
 A server that lies about keys & Detected, not prevented: pinning and safety numbers \\
 A stolen, unlocked computer & Not defended; auto-lock limits exposure \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\textbf{Key compromise, recovery and identity verification.} Table~\ref{tab:compromise} walks through what happens when a key or a secret is lost or exposed, since these cases decide how far the guarantees hold.
+
+\begin{table}[t]
+\centering
+\caption{What Happens When a Key or Secret Is Lost or Exposed}
+\label{tab:compromise}
+\scriptsize
+\begin{tabularx}{\columnwidth}{@{}>{\raggedright\arraybackslash}p{2.2cm} Y@{}}
+\toprule
+\textbf{Event} & \textbf{Consequence and remedy} \\
+\midrule
+Key file copied from a disk & The attacker must guess the passphrase offline; each guess costs one scrypt run (about 60 ms here), so a weak passphrase falls and a strong one holds. Rotate keys; everything that person could read before remains readable to the thief \\
+Device stolen unlocked & All that person's decrypted history and keys are exposed; rotate and re-key rooms. The app lock reduces the window only \\
+Passphrase forgotten & Restore from the recovery code (about 119 bits) on any computer \\
+Passphrase and recovery code lost & Old encrypted messages are unreadable by design; a reset publishes a new identity and contacts see a changed-key warning \\
+Long-term key stolen later & No forward secrecy: ciphertext already held by an attacker can be opened. A ratchet is future work \\
+Server swaps someone's key & First contact: not detectable without comparing the 60-digit safety numbers. After pinning: sending is blocked until the new key is accepted \\
+Member removed from the room & A new epoch starts and the removed person never receives its keys; what they already read stays read \\
 \bottomrule
 \end{tabularx}
 \end{table}
@@ -274,7 +321,7 @@ End-to-end encryption is the part of the design that changes what the server is.
 
 \textbf{Key lifecycle.} Keys can be rotated (a new identity, with the old ones kept so earlier messages still open and the server keeping the envelopes sealed to them), restored from the recovery code on a new computer with every identity, or reset, which discards history. An idle window locks itself, covering the interface, hiding dialogs and forgetting the keys until the passphrase is entered.
 
-\textbf{What the server still learns.} The server sees who talks to whom, when, the sizes of messages and files, reactions, who is mentioned, each person's role and the membership of the room; it can also withhold or delete messages, though it cannot read or forge them. Section~\ref{sec:discussion} lists the resulting limits.
+\textbf{What the server still learns, and what is not provided.} The server sees who talks to whom, when, the sizes of messages and files, reactions, who is mentioned, each person's role and the membership of the room; it can also withhold or delete messages, though it cannot read or forge them. There is \emph{no forward secrecy} (Table~\ref{tab:compromise}); identity is only as strong as the out-of-band comparison of safety numbers; and there is one active device per person. These limits are repeated in the abstract and in Section~\ref{sec:discussion} because they bound every confidentiality claim in this paper.
 
 \subsection{Development Path}\label{sec:path}
 LANChat-H was built in the milestones of Table~\ref{tab:stages}. Each ended with the whole test suite and the scripted window runs passing, and with the terminal client unchanged in behaviour (G2). The order matters: persistence and a versioned protocol came before the features that need message ids, security hardening before file sharing opened new attack surface, and end-to-end encryption last because it depends on identities, a key directory, the ticketed transfer path and the event schema all being stable.
@@ -329,37 +376,49 @@ The core uses only the Python standard library \cite{pysocket,pythreading,pystru
 \bottomrule
 \end{tabularx}
 \end{table*}
+
+%======================================================================
 \section{Evaluation}\label{sec:eval}
 %======================================================================
-All measurements were taken on one machine: an Apple-silicon laptop (arm64) running macOS 27.0.1 with CPython 3.13.9, with the server and clients on the loopback interface. The source code, tests and scripts (\code{bench/}) are published \cite{lanchatrepo}, and the numbers below are what they printed. Because client and server share one machine, the results show the cost of the software, not of a real network; they are not claims about Wi-Fi or Ethernet performance.
+All measurements were taken on one machine: an Apple-silicon laptop (arm64) running macOS 27.2 with CPython 3.14.9, with the server and clients on the loopback interface, and the server in one process and the load generators in separate processes. The source code, tests, scripts and the raw results (\code{bench/}, \code{bench/results/}, \code{security\_tests/}) are published \cite{lanchatrepo}. Because client and server share one machine, the results show the cost of the software, not of a real network (Section~\ref{sec:eval-workload} adds an emulated path). Unless stated, each setting was repeated and we report the mean $\pm$ standard deviation.
 
-\subsection{Correctness and Security Tests}
-The repository holds 22 test modules that run 452 tests, each starting real servers on free local ports. They cover framing (round trip, closed connection, oversized and zero-length frames), the version-1 and version-2 protocols, the database and its migrations, search and paging, TLS and certificate pinning including a changed certificate, discovery, file transfer (round trips, hash mismatch, cut-off uploads, hostile names, expired and reused tickets, quota, concurrent uploads), lockout, rate limits, password rules, saved sign-ins, administrator actions, tamper detection in the audit chain, and the encryption code, which is checked against published test vectors for X25519 and Ed25519 \cite{rfc7748,rfc8032} and then against tampering, wrong recipients, forged senders, replays, damaged and reordered files, and the room's rules for late joiners, removal and message numbering. One test wraps the server's send and receive functions, records every frame the server handles, and scans those frames, the database file and the stored files for the secret text, file names, file contents and file keys of encrypted messages; a companion check shows that the same capture would reveal a plaintext message. A further eleven scripts drive the real window and the terminal client through 370 checks, including runs with every security default on. All of them pass.
+\subsection{Correctness Tests}
+The repository holds 22 test modules that run 453 tests, each starting real servers on free local ports; one is skipped where a platform feature is missing. They cover framing (round trip, closed connection, oversized and zero-length frames), the version-1 and version-2 protocols, the database and its migrations, search and paging, TLS and certificate pinning including a changed certificate, discovery, file transfer (round trips, hash mismatch, cut-off uploads, hostile names, expired and reused tickets, quota, concurrent uploads), lockout, rate limits, password rules, saved sign-ins, administrator actions, tamper detection in the audit chain, and the encryption code, which is checked against published test vectors for X25519 and Ed25519 \cite{rfc7748,rfc8032} and then against tampering, wrong recipients, forged senders, replays, damaged and reordered files, and the room's rules for late joiners, removal and message numbering. A further eleven scripts drive the real window and the terminal client through 370 checks, including runs with every security default on.
 
-\subsection{Fan-Out Latency}
-One sender sent 100 messages of about 100 bytes at ten per second to $N$ receivers, each a real client with its own connection; every message was also written to the SQLite database before delivery. Receivers ran in separate processes of at most 20, and latency is the arrival time minus the send time on the machine's monotonic clock. Table~\ref{tab:fanout} shows that every message reached every receiver. Median latency stayed between 2.7 and 5.8 ms and the 95th percentile below 9.5 ms without TLS; with TLS the figures for 25 and 100 receivers were 4.7 and 6.4 ms (median) and 7.5 and 11.3 ms (95th percentile).
+\subsection{Fan-Out Latency and Comparison with Other Servers}\label{sec:eval-fanout}
+One sender sent 60 messages of about 100 bytes at ten per second to $N$ receivers, each a real client with its own connection; latency is the arrival time minus the send time on the machine's monotonic clock. To compare with other designs we wrote three minimal relays that speak the same wire protocol: a \emph{sequential relay} (thread per client, blocking send to each recipient in turn), an \emph{asyncio relay} (one event loop, a bounded queue and a writer task per client) and an \emph{asyncio relay with SQLite}, which stores every message before delivering it. None of them checks accounts, roles or rate limits or renders events for two protocol versions, so they show a lower bound for each design, not a like-for-like product. Peak memory and CPU time belong to the server process and were measured in a fresh process for each trial.
 
-\begin{table}[t]
+Table~\ref{tab:fanout} shows that every message reached every receiver in every trial, and that the spread between trials is small (a standard deviation of at most 0.4 ms for the median). The medians for LANChat-H rise from 4.3 ms with 10 receivers to 6.9 ms with 100, against 1.0 to 2.3 ms for the \code{asyncio} relay and 2.0 to 3.0 ms with SQLite. The remaining difference is the work that LANChat-H does for each message: checking the sender's role and rate limit, storing the message, parsing mentions, and rendering it for each protocol version. The same cost shows in CPU time: 4.4 s over a ten-second run with 100 receivers, against 0.2 s for the \code{asyncio} relays, and 54 MB of memory against 33 MB. TLS added about 0.4 ms at 100 receivers. At 200 receivers the server used 9.6 s of CPU in a run of about ten seconds, so the design saturates one core, as its single-process Python threads would suggest, at roughly 200 receivers sending ten messages a second; this is the point at which an \code{asyncio} or multi-process design would be needed, and we do not claim the thread-per-client server scales beyond it.
+
+\begin{table*}[t]
 \centering
-\caption{Broadcast Latency vs.\ Receivers (loopback, ms)}
+\caption{Broadcast Latency, CPU and Memory by Server and Number of Receivers (loopback; mean $\pm$ standard deviation over 8 trials, 5 for TLS and 200 receivers; every message reached every receiver in every trial)}
 \label{tab:fanout}
 \footnotesize
-\begin{tabularx}{\columnwidth}{@{}c c Y Y Y c@{}}
+\begin{tabularx}{0.82\textwidth}{@{}r l Y Y Y Y@{}}
 \toprule
-$N$ & TLS & \textbf{Median} & \textbf{p95} & \textbf{Max} & Delivered \\
+\textbf{Receivers} & \textbf{Server} & \textbf{Median (ms)} & \textbf{p95 (ms)} & \textbf{CPU (s)} & \textbf{Peak RSS (MB)} \\
 \midrule
-1 & no & 3.23 & 4.64 & 6.98 & 100\,\% \\
-5 & no & 3.67 & 4.93 & 16.65 & 100\,\% \\
-10 & no & 2.71 & 5.23 & 7.78 & 100\,\% \\
-25 & no & 2.72 & 5.91 & 11.51 & 100\,\% \\
-50 & no & 4.16 & 6.65 & 26.70 & 100\,\% \\
-100 & no & 5.83 & 9.40 & 13.94 & 100\,\% \\
-1 & yes & 2.88 & 4.69 & 6.00 & 100\,\% \\
-25 & yes & 4.66 & 7.46 & 13.59 & 100\,\% \\
-100 & yes & 6.44 & 11.32 & 21.33 & 100\,\% \\
+10 & Sequential relay & 0.67{\,\scriptsize$\pm$0.03} & 1.16{\,\scriptsize$\pm$0.06} & 0.02{\,\scriptsize$\pm$0.00} & 32.2{\,\scriptsize$\pm$0.3} \\
+ & asyncio relay & 1.01{\,\scriptsize$\pm$0.08} & 1.62{\,\scriptsize$\pm$0.17} & 0.05{\,\scriptsize$\pm$0.00} & 32.4{\,\scriptsize$\pm$0.3} \\
+ & asyncio + SQLite & 1.99{\,\scriptsize$\pm$0.05} & 2.83{\,\scriptsize$\pm$0.12} & 0.09{\,\scriptsize$\pm$0.00} & 33.4{\,\scriptsize$\pm$0.2} \\
+ & \textbf{LANChat-H} & 4.34{\,\scriptsize$\pm$0.07} & 5.50{\,\scriptsize$\pm$0.37} & 0.61{\,\scriptsize$\pm$0.01} & 47.3{\,\scriptsize$\pm$0.2} \\
+\midrule
+50 & Sequential relay & 1.05{\,\scriptsize$\pm$0.09} & 2.25{\,\scriptsize$\pm$0.11} & 0.06{\,\scriptsize$\pm$0.00} & 33.7{\,\scriptsize$\pm$0.3} \\
+ & asyncio relay & 1.72{\,\scriptsize$\pm$0.03} & 3.23{\,\scriptsize$\pm$0.19} & 0.13{\,\scriptsize$\pm$0.00} & 33.0{\,\scriptsize$\pm$0.2} \\
+ & asyncio + SQLite & 2.53{\,\scriptsize$\pm$0.21} & 4.11{\,\scriptsize$\pm$0.38} & 0.15{\,\scriptsize$\pm$0.02} & 34.0{\,\scriptsize$\pm$0.2} \\
+ & \textbf{LANChat-H} & 5.78{\,\scriptsize$\pm$0.12} & 7.19{\,\scriptsize$\pm$0.32} & 2.24{\,\scriptsize$\pm$0.04} & 50.6{\,\scriptsize$\pm$0.2} \\
+\midrule
+100 & Sequential relay & 1.60{\,\scriptsize$\pm$0.19} & 3.35{\,\scriptsize$\pm$0.25} & 0.11{\,\scriptsize$\pm$0.01} & 35.4{\,\scriptsize$\pm$0.3} \\
+ & asyncio relay & 2.32{\,\scriptsize$\pm$0.13} & 4.40{\,\scriptsize$\pm$0.28} & 0.21{\,\scriptsize$\pm$0.01} & 33.0{\,\scriptsize$\pm$0.2} \\
+ & asyncio + SQLite & 2.98{\,\scriptsize$\pm$0.22} & 4.75{\,\scriptsize$\pm$0.43} & 0.24{\,\scriptsize$\pm$0.01} & 33.8{\,\scriptsize$\pm$0.2} \\
+ & \textbf{LANChat-H} & 6.89{\,\scriptsize$\pm$0.18} & 8.84{\,\scriptsize$\pm$0.25} & 4.40{\,\scriptsize$\pm$0.25} & 54.0{\,\scriptsize$\pm$0.2} \\
+
+100 (TLS) & \textbf{LANChat-H} & 7.32{\,\scriptsize$\pm$0.09} & 9.68{\,\scriptsize$\pm$0.51} & 4.48{\,\scriptsize$\pm$0.07} & 59.4{\,\scriptsize$\pm$0.1} \\
+200 & \textbf{LANChat-H} & 10.14{\,\scriptsize$\pm$0.37} & 14.39{\,\scriptsize$\pm$1.77} & 9.56{\,\scriptsize$\pm$0.15} & 62.1{\,\scriptsize$\pm$0.2} \\
 \bottomrule
 \end{tabularx}
-\end{table}
+\end{table*}
 
 \subsection{Head-of-Line Blocking}
 The fan-out cost model predicts the effect of a stalled receiver. With sequential sends, recipient $k$ receives the message after
@@ -372,71 +431,93 @@ D_k \;\ge\; W + \sum_{j=1}^{k} s_j \qquad \text{for all } k \ge m .
 \end{equation}
 With a bounded queue and writer thread the send to each recipient reduces to an enqueue with cost $q_j \ll W$, so $D_k$ no longer depends on $W$ for $k \neq m$.
 
-To test this we compared LANChat-H with a minimal sequential relay written for the experiment: a thread per client that sends each incoming message to every other client in turn with a blocking \code{sendall}. Both use the same framing. Ten receivers read normally; one more connects first, shrinks its receive buffer to 4 KiB and never reads. A sender sends 600 messages of 2000 bytes at 50 per second. Table~\ref{tab:hol} gives the range over four runs. Once the kernel buffers for the stalled connection were full, after 232 messages (about 460 kB), the sequential relay stopped delivering to every receiver: exactly 2320 deliveries (232 messages to each of ten receivers) arrived in every run, out of 5370 to 5400 expected, and the sender's own sends began to time out after 537 to 540 messages. With the stalled receiver present LANChat-H delivered 6000 of 6000 messages to the ten healthy receivers, and dropped the stalled connection once its queue filled.
+Ten receivers read normally; one more connects first, shrinks its receive buffer to 4 KiB and never reads. A sender sends 600 messages of 2000 bytes at 50 per second. Once the kernel buffers for the stalled connection were full, after 232 messages (about 460 kB), the sequential relay stopped delivering to every receiver: exactly 2320 deliveries arrived in all ten trials, out of 5370 to 5400 expected, and the sender's own sends began to time out. LANChat-H and both \code{asyncio} relays delivered 6000 of 6000 in all ten trials (Table~\ref{tab:hol}), so the isolation comes from the bounded queue, not from threads or from our code in particular: any design that never blocks on one receiver has it. LANChat-H also dropped the stalled connection once its queue filled in all ten trials. In the absence of a stall the sequential relay is faster per message (under 1 ms against 4 ms) for the reasons given above, so isolation is a trade of a few milliseconds for the guarantee that one bad connection cannot stop the room.
 
 \begin{table}[t]
 \centering
-\caption{One Stalled Receiver, Ten Healthy Ones}
+\caption{One Stalled Receiver, Ten Healthy Ones (10 trials per server; 600 messages of 2000 bytes at 50 per second; deliveries to the ten healthy receivers)}
 \label{tab:hol}
 \footnotesize
-\begin{tabularx}{\columnwidth}{@{}l c Y Y Y@{}}
+\begin{tabularx}{\columnwidth}{@{}l c Y c@{}}
 \toprule
-\textbf{Server} & \textbf{Stalled} & \textbf{Delivered} & \textbf{Median ms} & \textbf{p95 ms} \\
+\textbf{Server} & \textbf{Delivered} & \textbf{Median (ms)} & \textbf{Stalled dropped} \\
 \midrule
-Sequential relay & no & 6000/6000 & 0.65--0.78 & 1.36--5.46 \\
-Sequential relay & yes & 2320/5370--5400 & 0.61--0.85 & 1.38--13.03 \\
-LANChat-H & no & 6000/6000 & 3.75--4.36 & 5.36--8.82 \\
-LANChat-H & yes & 6000/6000 & 3.16--4.58 & 5.53--5.92 \\
+Sequential relay & 2320/5370--5400 & 0.66{\,\scriptsize$\pm$0.06} & not measured \\
+asyncio relay & 6000/6000 & 1.01{\,\scriptsize$\pm$0.05} & not measured \\
+asyncio + SQLite & 6000/6000 & 1.56{\,\scriptsize$\pm$0.09} & not measured \\
+\textbf{LANChat-H} & 6000/6000 & 4.01{\,\scriptsize$\pm$0.04} & 10/10 \\
 \bottomrule
 \end{tabularx}
 \end{table}
 
-The table also shows the price. In the absence of a stall the sequential relay is faster per message (median under 1 ms against 4 ms), because it does no more than forward bytes, whereas LANChat-H also persists each message, checks the sender's role and rate limit, and renders it for each protocol version. Isolation of slow receivers is therefore a trade of a few milliseconds of latency for the guarantee that one bad connection cannot stop the room.
+\subsection{Mixed Workload and Emulated Network Path}\label{sec:eval-workload}
+Fan-out at a regular rate is not how people chat, so we also ran a mixed workload with every default limit on and TLS enabled: 40 clients (100 in the last row), each sending a text message after an exponentially distributed pause (mean 6 s) with a log-normal size (median about 60 bytes), every client sending the heartbeat that real clients send, and one more client uploading a 1 MB file every 5 seconds while the chat ran. To emulate a network path on one machine we put a small user-space proxy between clients and server that delays each direction by a base time plus Gaussian jitter (\code{bench/netem.py}). It cannot create packet loss, which TCP hides from applications as extra delay, so loss is represented only by jitter.
 
-\subsection{File Transfer Speed}
-Table~\ref{tab:xfer} gives the median of three runs for uploading and then downloading a random file through the ticket and data-connection path, including hashing, the ticket exchange and verification. Throughput is in the hundreds of megabytes per second on loopback and TLS costs roughly a third for small files and less for large ones. These figures show that the design adds no obvious bottleneck; they say nothing about a wireless link, which would dominate in practice.
+Table~\ref{tab:workload} shows that every message reached every receiver in every run. With no added delay the median stayed at about 5 ms with 40 clients and about 7 ms with 100, and the 1 MB uploads, which ran alongside the chat, finished in about 20 ms. With an added one-way delay $d$ the median grew to about $2d + 7$ ms ($d{=}5$: 17 ms; $d{=}20$: 47 ms; $d{=}50$: 108 ms; $d{=}100$: 207 ms), that is, the server added a roughly constant 7--8 ms on top of the two crossings of the path, and the upload time grew in line with the round trips that the ticket exchange needs. This is an emulation, not a measurement of Wi-Fi or Ethernet; the script \code{bench/lan\_probe.py} measures the same round trip from a second device against a real server, but we have not yet run it across several machines.
 
 \begin{table}[t]
 \centering
-\caption{File Transfer Throughput (loopback, MB/s, median of 3)}
+\caption{Mixed Workload over TLS with All Limits On (60 s; text messages at random times plus a 1 MB upload every 5 s; emulated one-way delay $\pm$ jitter in ms)}
+\label{tab:workload}
+\footnotesize
+\begin{tabularx}{\columnwidth}{@{}c c Y Y Y c Y Y@{}}
+\toprule
+\textbf{Cl.} & \textbf{Delay} & \textbf{Med.} & \textbf{p95} & \textbf{p99} & \textbf{Deliv.} & \textbf{1 MB (s)} & \textbf{CPU (s)} \\
+\midrule
+40 & 0 $\pm$ 0 & 4.8 & 6.7 & 7.9 & 100.0\,\% & 0.02 & 4.2 \\
+40 & 5 $\pm$ 1 & 16.7 & 20.5 & 22.1 & 100.0\,\% & 0.08 & 4.2 \\
+40 & 20 $\pm$ 4 & 47.0 & 57.0 & 61.5 & 100.0\,\% & 0.24 & 4.3 \\
+40 & 50 $\pm$ 10 & 108.0 & 131.7 & 141.8 & 100.0\,\% & 0.57 & 4.3 \\
+40 & 100 $\pm$ 20 & 207.4 & 253.8 & 272.6 & 100.0\,\% & 1.08 & 4.4 \\
+100 & 0 $\pm$ 0 & 6.8 & 10.6 & 14.1 & 100.0\,\% & 0.02 & 15.9 \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\subsection{File Transfer Speed}
+Table~\ref{tab:xfer} gives the median and range of seven runs for uploading and then downloading a random file through the ticket and data-connection path, including hashing, the ticket exchange and verification. Throughput is in the hundreds of megabytes per second on loopback, rises with file size, and TLS costs roughly a third for small files and less for large ones. The runs vary most for 1 MB files, where fixed costs dominate. These figures show that the design adds no obvious bottleneck; they say nothing about a wireless link, which would dominate in practice.
+
+\begin{table}[t]
+\centering
+\caption{File Transfer Throughput (loopback, MB/s, median [range] of 7 runs)}
 \label{tab:xfer}
 \footnotesize
 \begin{tabularx}{\columnwidth}{@{}r c Y Y@{}}
 \toprule
 \textbf{File (MB)} & \textbf{TLS} & \textbf{Upload} & \textbf{Download} \\
 \midrule
-1 & no & 282 & 636 \\
-1 & yes & 171 & 303 \\
-5 & no & 409 & 539 \\
-5 & yes & 370 & 464 \\
-20 & no & 616 & 595 \\
-20 & yes & 394 & 461 \\
+1 & no & 273 [143--318] & 573 [425--703] \\
+1 & yes & 185 [160--194] & 302 [284--337] \\
+5 & no & 660 [571--702] & 1032 [945--1127] \\
+5 & yes & 418 [393--476] & 648 [593--696] \\
+20 & no & 816 [732--872] & 950 [892--1085] \\
+20 & yes & 636 [572--653] & 691 [548--746] \\
 \bottomrule
 \end{tabularx}
 \end{table}
 
 \subsection{Cost of Security Operations}
-Table~\ref{tab:cost} lists the median time of single operations. A password check costs about 27 ms by design: it is the price of making offline guessing expensive. Encrypting a message for one person (a random key sealed twice and a signature) takes about 0.3 ms and decrypting it 0.26 ms, a room message under 0.3 ms, and a 20 MB file is encrypted in about 31 ms and decrypted in about 23 ms (roughly 650 and 850 MB/s). The cost of end-to-end encryption is therefore dominated by passphrase stretching and key management, not by the ciphers, and the server's own work is unchanged: it relays the same frames.
+Table~\ref{tab:cost} lists the median time of single operations over 30 runs; the standard deviation was under 10\,\% of the median for every operation. A password check costs about 29 ms by design: it is the price of making offline guessing expensive. Encrypting a message for one person (a random key sealed twice and a signature) takes about 0.3 ms and decrypting it 0.25 ms, a room message under 0.3 ms, and a 20 MB file is encrypted in about 30 ms and decrypted in about 20 ms (roughly 670 and 990 MB/s). The cost of end-to-end encryption is therefore dominated by passphrase stretching and key management, not by the ciphers, and the server's own work is unchanged: it relays the same frames.
 
 \begin{table}[t]
 \centering
-\caption{Cost of Single Operations (median of 15 runs)}
+\caption{Cost of Single Operations (median of 30 runs)}
 \label{tab:cost}
 \footnotesize
 \begin{tabularx}{\columnwidth}{@{}Y r@{}}
 \toprule
 \textbf{Operation} & \textbf{Time (ms)} \\
 \midrule
-Password check (scrypt $n=2^{14}$) & 27.3 \\
-Wrap secret keys with a passphrase (scrypt $n=2^{15}$) & 57.7 \\
+Password check (scrypt $n=2^{14}$) & 28.6 \\
+Wrap secret keys with a passphrase (scrypt $n=2^{15}$) & 59.6 \\
 Generate an identity (X25519 and Ed25519) & 0.05 \\
 Safety number (5200 SHA-512 rounds) & 2.1 \\
-Encrypt a 200-byte message for one person & 0.31 \\
-Decrypt it & 0.26 \\
-Room message: encrypt / decrypt & 0.17 / 0.26 \\
-Seal a chain key for one member & 0.25 \\
-Walk a room chain forward 1000 steps & 1.3 \\
-Encrypt / decrypt a 20 MB file & 30.7 / 23.4 \\
+Encrypt a 200-byte message for one person & 0.30 \\
+Decrypt it & 0.25 \\
+Room message: encrypt / decrypt & 0.16 / 0.25 \\
+Seal a chain key for one member & 0.26 \\
+Walk a room chain forward 1000 steps & 1.4 \\
+Encrypt / decrypt a 20 MB file & 29.9 / 20.2 \\
 \bottomrule
 \end{tabularx}
 \end{table}
@@ -444,9 +525,22 @@ Encrypt / decrypt a 20 MB file & 30.7 / 23.4 \\
 \subsection{Confidentiality Check}
 The confidentiality claim of G5 is checked by observation rather than by argument. The test wraps the server's receive and send functions so that every frame it handles is recorded. It then has two people exchange a private message, a private edit, a room message and an encrypted file with a caption, and scans all recorded frames, the SQLite file and the stored files for the secret message texts, the real file name and type, the file contents, the file key and the people's secret keys. None appears; the traffic does contain the encrypted envelopes, so the capture is real. A companion check sends a plaintext message through the same capture and finds it, so the scan would notice a leak. Separate tests assert that the database holds an empty body and an opaque attachment name for encrypted messages, that neither a chain key nor a recovery code is stored, and that a removed member, a late joiner and a person without keys cannot open what they should not.
 
-\subsection{Threats to Validity}
-The experiments use one machine, one Python version and the loopback interface, so queueing in the network, wireless loss and operating-system differences are absent. Latency includes scheduling of separate Python processes and is not a pure network figure. The synthetic load is regular (fixed rate and size), not a trace of real conversations. The sequential relay is a minimal baseline written for the comparison, not a measurement of any other published system, and the claim that thread-per-client stops being adequate at some size has not been tested because no asynchronous variant was built. The tests show that behaviours occur; they do not prove their absence elsewhere.
+\subsection{Our Own Robustness and Security Testing}\label{sec:eval-sec}
+We also tested the server as an attacker would, with tools we wrote or ran ourselves. \emph{This is not independent testing}; an external review remains future work and is listed as a limit.
+\begin{itemize}
+  \item \textbf{Fuzzing} (\code{security\_tests/fuzz.py}). Twenty seeded runs against a live server sent about 29{,}600 hostile connections before sign-in (random bytes, zero and huge length prefixes, truncated frames, malformed hellos, HTTP requests, oversized passwords), about 160{,}000 mutated events after sign-in as a member and as an administrator, covering every event type the server knows with fields replaced by hostile values (null, huge integers, long strings, nested containers, wrong types), and 4{,}000 made-up transfer tickets. After each run a fresh client still signed in and exchanged a message. The first version of this test found one real bug: an integer above $2^{63}$ in a field that reaches SQLite raised an unhandled \code{OverflowError} that ended the sender's connection thread. We fixed it by refusing the malformed request while keeping the connection, added a regression test, and the final runs found no unhandled exception in any server thread, with memory growth of about 1 MB.
+  \item \textbf{TLS probe} (\code{security\_tests/tls\_probe.py}). The server refused TLS 1.0 and 1.1, accepted 1.2 (ECDHE-RSA-AES256-GCM-SHA384) and 1.3 (TLS\_AES\_256\_GCM\_SHA384), refused a client pinned to a different certificate and a client trusting only public authorities, and reset a plain-text client.
+  \item \textbf{Static scan.} Bandit reported no high-severity finding in the code (about 13{,}600 lines scanned, tests included). Of the 10 medium findings in the server and client code, 3 are the intended bind to all interfaces of a LAN server and 7 are queries built from fixed fragments and question-mark placeholders only; we inspected each and found no injection path.
+\end{itemize}
 
+\subsection{Threats to Validity}
+\begin{itemize}
+  \item \emph{One machine, one Python version, loopback.} Client and server compete for the same cores, and no real network, wireless loss or second device was involved; the emulated delay shows the behaviour of the server under a slow path, not of a real one. A real multi-device study was prepared (\code{bench/lan\_probe.py}) but not run.
+  \item \emph{Few trials.} Eight trials per setting (five for TLS and for 200 receivers, ten for the stalled-receiver test) give a tight spread here but are not a statistical study; the mixed workload was run once per setting, and the 100-client row should be read as indicative.
+  \item \emph{Baselines are minimal relays}, not other chat products. They show what the same wire protocol costs with and without the extra work of LANChat-H, and they are not measurements of Signal, Matrix, XMPP or IRC servers; no suitable open implementation with the same features and protocol was available for a like-for-like comparison.
+  \item \emph{Synthetic load.} The workload is generated from simple distributions, not a trace of real conversations.
+  \item \emph{Self-run security testing.} The fuzzing, TLS probe and static scan were written and run by the authors, with a fixed set of generators; they show that these inputs are handled, not that no other input breaks the system, and they are not a substitute for an independent review.
+\end{itemize}
 
 %======================================================================
 \section{Discussion and Limitations}\label{sec:discussion}
@@ -461,14 +555,14 @@ The experiments use one machine, one Python version and the loopback interface, 
 
 \textbf{Scope of encryption.} Terminal clients and members without keys cannot take part in encrypted conversations; search of encrypted messages covers what the window has loaded; and files shared in readable conversations are stored unencrypted. The window is not a vault: decrypted text lives in memory while it is open.
 
-\textbf{Scale and evidence.} The design is one server, one thread per client and one SQLite connection behind a lock. We do not establish where this stops being adequate; an \code{asyncio} server \cite{pyasyncio} under identical workloads, a multi-host study with packet loss and wireless links, and measurements with more clients are the obvious next experiments. The security claims rest on tests of this implementation, not on a formal analysis or an external review, and the primitives are audited but their composition here is new.
+\textbf{Scale and evidence.} The design is one server, one thread per client and one SQLite connection behind a lock. Our measurements put the single-core limit near 200 receivers at ten messages a second, where a design on an event loop \cite{pyasyncio} would use far less CPU for the same fan-out (Table~\ref{tab:fanout}); we did not build a full \code{asyncio} version of LANChat-H, so how much of its feature cost would remain is untested. A study across several real devices and wireless links is also still to be done. The security claims rest on tests of this implementation, our own fuzzing and a static scan, not on a formal analysis or an independent review, and the primitives are audited but their composition here is new.
 
-\textbf{Future work.} A ratchet for forward secrecy, multiple devices per person, sealed-sender style protection of metadata, an asynchronous server variant, and an independent security review.
+\textbf{Future work.} A ratchet for forward secrecy, multiple devices per person, sealed-sender style protection of metadata, an asynchronous server with the full feature set, measurements over real Wi-Fi and Ethernet with several devices, and an independent security review.
 
 %======================================================================
 \section{Conclusion}\label{sec:conclusion}
 %======================================================================
-LANChat-H shows that a chat system for a local network can combine a simple compatible protocol, isolation of slow clients, layered transport and account security, and end-to-end encryption for private conversations and an optional group room, in a code base small enough to read and with one optional dependency. The measurements on one machine show what the design costs and buys: a few milliseconds of extra per-message work (storage, checks and queueing) in return for a room that survives a stalled receiver, and a fraction of a millisecond per encrypted message in return for a server that holds only ciphertext. A test that scans everything the server handles confirms that claim for the conversations tested. The limits are stated plainly: there is no forward secrecy, the server still sees metadata, no asynchronous variant was compared, and all measurements come from one machine. The next steps are a ratchet, a multi-host evaluation, and an independent review.
+LANChat-H shows that a chat system for a local network can combine a simple compatible protocol, isolation of slow clients, layered transport and account security, and end-to-end encryption for private conversations and an optional group room, in a code base small enough to read and with one optional dependency. The measurements on one machine show what the design costs and buys: a few milliseconds of extra per-message work (storage, checks and queueing; about 7 ms on top of the path delay in our mixed workload) in return for a room that survives a stalled receiver, and a fraction of a millisecond per encrypted message in return for a server that holds only ciphertext. A test that scans everything the server handles confirms that claim for the conversations tested. The limits are stated plainly: there is no forward secrecy, the server still sees metadata, trust on first use is only as strong as the first comparison, the thread-per-client server saturates a core at about 200 receivers, and all measurements, including our own security testing, come from one machine and the authors. The next steps are a ratchet, a multi-device evaluation over real networks, an \code{asyncio} server with the full feature set, and an independent review.
 
 \balance
 \begin{thebibliography}{99}
@@ -507,6 +601,8 @@ LANChat-H shows that a chat system for a local network can combine a simple comp
 \bibitem{pythreading} Python Software Foundation, ``threading,'' \emph{Python 3 Documentation}. \url{https://docs.python.org/3/library/threading.html}
 \bibitem{pystruct} Python Software Foundation, ``struct,'' \emph{Python 3 Documentation}. \url{https://docs.python.org/3/library/struct.html}
 \bibitem{pyssl} Python Software Foundation, ``ssl,'' \emph{Python 3 Documentation}. \url{https://docs.python.org/3/library/ssl.html}
+\bibitem{matrix} The Matrix.org Foundation, ``Matrix Specification,'' https://spec.matrix.org, accessed 2026.
+\bibitem{omemo} XMPP Standards Foundation, ``XEP-0384: OMEMO Encryption,'' https://xmpp.org/extensions/xep-0384.html, accessed 2026.
 \bibitem{pyasyncio} Python Software Foundation, ``asyncio,'' \emph{Python 3 Documentation}. \url{https://docs.python.org/3/library/asyncio.html}
 \bibitem{rfc959} J. Postel and J. Reynolds, ``File Transfer Protocol (FTP),'' IETF, RFC 959, Oct. 1985.
 \bibitem{rfc4251} T. Ylonen and C. Lonvick, Ed., ``The Secure Shell (SSH) protocol architecture,'' IETF, RFC 4251, Jan. 2006.

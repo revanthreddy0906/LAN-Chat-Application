@@ -708,7 +708,12 @@ class ChatServer(AdminMixin, KeysMixin, RoomMixin):
             return
         if not self._within_rate(client, LIMITED_EVENTS.get(event["t"], 0.0)):
             return
-        handler(self, client, event)
+        try:
+            handler(self, client, event)
+        except (OverflowError, TypeError, ValueError, KeyError, AttributeError, IndexError) as error:
+            # a hostile or buggy client sent a field of the wrong type or size: refuse that request, keep the connection
+            self._log(YELLOW, f"Rejected a malformed '{event['t']}' from {client.username}: {type(error).__name__}")
+            self._error(client, "that request was malformed.")
 
     def _within_rate(self, client: Client, cost: float) -> bool:
         if cost <= 0 or client.limiter is None or client.limiter.allow(cost):
